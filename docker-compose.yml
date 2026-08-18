@@ -1,0 +1,46 @@
+# docker compose up -d --build
+#
+# Backend only — this repo now deploys standalone (own git repo, own
+# Dockerfile), so this compose file no longer orchestrates the frontend too;
+# that lives in its own repo/deployment (Vercel). This file is for local
+# development from within the monorepo checkout, where data/ and logs/ are
+# still real sibling directories one level up. It is NOT how a real hosting
+# platform (Render/Railway/Fly/etc) would run this image — those build the
+# Dockerfile directly and need their own answer for getting data/chunks.json
+# onto the instance (see the Dockerfile's own comment on this).
+#
+# Reads credentials straight from .env (env_file:, not this file) — the same
+# .env already used for local runs, no separate secrets file.
+#
+# One override is deliberate: OLLAMA_HOST in .env.example defaults to
+# 127.0.0.1:11434 because that's correct when the backend runs directly on
+# the host. Inside a container 127.0.0.1 is the container itself, not the
+# host, so `environment:` below overrides it to host.docker.internal — that
+# entry always wins over the same key loaded from env_file:. Delete the
+# override if Ollama runs in its own container on this compose network
+# instead of on the host.
+services:
+  backend:
+    build: .
+    container_name: dpdp-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      # The frontend's BROWSER-reachable origin (its Vercel URL in
+      # production, http://localhost:3000 for local dev against
+      # frontend/server.py running separately) — the browser enforces this,
+      # not this container, so it has no bearing on where the frontend is
+      # actually hosted.
+      - DPDP_CORS_ORIGINS=http://localhost:3000
+    volumes:
+      # One level up: data/ and logs/ are siblings of backend/ in the
+      # monorepo checkout this compose file is meant to be run from, not
+      # inside backend/ itself.
+      - ../data:/app/data:ro
+      - ../logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

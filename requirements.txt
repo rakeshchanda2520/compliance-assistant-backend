@@ -1,0 +1,31 @@
+# Runtime — what the backend needs to serve answers.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sse-starlette>=2.1
+pydantic>=2.9
+neo4j>=5.24
+rank-bm25>=0.2.2
+snowballstemmer>=2.2
+PyYAML>=6.0
+# Verifies the Supabase access token on every request. A dependency rather
+# than stdlib HTTP (the pattern llm.py follows for simple REST APIs) because
+# signature verification is a security primitive — the one place where
+# hand-rolling costs more than it saves. Needs PyJWKClient, added in 2.x.
+PyJWT>=2.8
+# Every question and answer, once auth.require_user has verified who asked.
+# [srv] pulls in dnspython, needed to resolve the mongodb+srv:// DNS-seedlist
+# form Atlas gives you — importing without it fails at connection time, not
+# at pip install time, so it is easy to miss.
+pymongo[srv]>=4.9
+
+# Build only — kg_build. Not imported by the serving path.
+pdfplumber>=0.11
+networkx>=3.3
+
+# Optional: only when DPDP_PROVIDER=claude.
+# anthropic>=0.40
+
+# Optional: only when LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set.
+# >=3.0 for the start_as_current_observation() API observability.py uses;
+# tested against 4.14.4.
+langfuse>=3.0

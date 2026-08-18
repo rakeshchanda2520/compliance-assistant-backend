@@ -1,0 +1,10 @@
+.env
+# data/ and logs/ are local-dev-only junctions (see .gitignore) — neither is
+# COPYed into the image by the Dockerfile, so there's no reason to send
+# either into the build context at all.
+data/
+logs/
+__pycache__/
+*.pyc
+.venv/
+.git/
