@@ -4,14 +4,20 @@
 # Contains full questions and answers — operational data, not source.
 logs/
 
-# In a local monorepo checkout, data/ and logs/ are directory JUNCTIONS
-# (Windows) pointing at the real Compliance-Assistant-level data/logs — see
-# the setup note in README.md. Not real content of this repo, so the whole
-# directory is ignored, not just chunks.json: on an actual standalone clone/
-# deploy of this repo, data/ won't exist as a junction at all, and a fresh
-# data/chunks.json + data/vocab.yaml need to land here by whatever means
-# that deployment target uses (see Dockerfile's own comment on this).
-data/
+# data/chunks.json and data/vocab.yaml ARE committed here — deliberately,
+# unlike the monorepo's own copies. This repo has no kg_build/ and cannot
+# regenerate them; without a copy checked in, there is nothing for the
+# Dockerfile to bake into the image and nothing for the app to serve (this
+# is exactly the failure a hosting platform hits if they're missing:
+# RuntimeError: search index missing at chunks.json).
+#
+# in the monorepo checkout, backend/logs is a directory JUNCTION (Windows)
+# pointing at the real Compliance-Assistant-level logs/ — see the setup note
+# in README.md. That one is fine to stay ignored: it's write-only runtime
+# state, never a build input.
+data/*.pdf
+data/overrides.yaml
+data/plain_language.json
 
 __pycache__/
 *.pyc

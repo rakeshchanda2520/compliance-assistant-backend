@@ -12,14 +12,19 @@
 # /api/* only, and expects DPDP_CORS_ORIGINS to name wherever the frontend
 # is actually deployed, or the browser blocks every request from reaching it.
 #
-# Getting data/chunks.json onto this container at runtime is this repo's
-# responsibility once deployed on its own — docker-compose.yml's volume
-# mount only works for local development from within the monorepo checkout,
-# where data/ is still a real sibling directory. A real hosting platform
-# needs its own answer (a persistent volume, an init step that pulls
-# chunks.json from object storage, etc.) — there is no single right answer
-# baked in here on purpose, since it depends entirely on where this repo
-# ends up deployed.
+# data/chunks.json and data/vocab.yaml are BAKED INTO THIS IMAGE (see the
+# COPY below) — committed to this repo, not derived at build time (this repo
+# has no kg_build/ to derive them with). This was tried the other way first
+# (mounted as a volume, nothing copied in) and it fails exactly the way
+# you'd expect on a real hosting platform with no shared filesystem to the
+# monorepo: `RuntimeError: search index missing at chunks.json` on every
+# boot. The trade-off this accepts: the corpus only updates on a rebuild, not
+# automatically. When the source PDFs change and `python -m kg_build` is
+# re-run in the monorepo, `data/chunks.json` here needs a fresh copy and a
+# redeploy — it does not update itself. For how rarely a statute amends,
+# that's the right side of this trade-off; `docker-compose.yml`'s volume
+# mount is still how local dev picks up a rebuild instantly, without needing
+# a copy-and-redeploy cycle for every iteration.
 
 FROM python:3.11-slim
 
@@ -43,11 +48,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # below resolve correctly.
 COPY backend/ backend/
 
-# data/ and logs/ are not copied in: data/chunks.json and data/vocab.yaml
-# are runtime state (see the module docstring above for how they get here),
-# and logs/ is written by the app. Mounted as volumes for local dev — see
-# docker-compose.yml.
-RUN mkdir -p data logs
+# The corpus, baked in — see the module docstring above. Committed to this
+# repo at data/chunks.json and data/vocab.yaml, not generated here.
+COPY data/ data/
+
+# logs/ is NOT copied in — it's write-only runtime state (audit.jsonl,
+# appended per request), never a build input. Created empty; mounted as a
+# volume for local dev (docker-compose.yml) so it survives a container
+# restart there, but on most hosting platforms this is ephemeral by nature
+# of the platform, same as it always was.
+RUN mkdir -p logs
 
 # Runs as a non-root user; logs/ is written by the app (audit.jsonl at 0600).
 RUN useradd --create-home --uid 1000 app \

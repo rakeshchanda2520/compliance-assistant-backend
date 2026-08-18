@@ -1,10 +1,14 @@
 .env
-# data/ and logs/ are local-dev-only junctions (see .gitignore) — neither is
-# COPYed into the image by the Dockerfile, so there's no reason to send
-# either into the build context at all.
-data/
+# data/chunks.json and data/vocab.yaml ARE sent to the build context and
+# COPYed into the image now — this repo has no other way to get the corpus
+# onto a hosting platform. logs/ stays excluded: it's a local-dev-only
+# junction (see .gitignore), write-only runtime state, never a build input.
 logs/
-__pycache__/
-*.pyc
+# Unlike .gitignore, dockerignore patterns are NOT recursive by default —
+# `__pycache__/` alone only matched the context root, not backend/backend/
+# __pycache__/, and a stray one leaked into a real build (caught by actually
+# running the image and looking, not by reading this file and assuming).
+**/__pycache__/
+**/*.pyc
 .venv/
 .git/
