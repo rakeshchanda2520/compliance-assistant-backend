@@ -31,7 +31,8 @@ import time
 from contextlib import asynccontextmanager
 
 import yaml
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import (Depends, FastAPI, HTTPException, Query, Request,
+                     Response)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -72,13 +73,36 @@ async def lifespan(app: FastAPI):
     STATE.clear()
 
 
-app = FastAPI(title="DPDP Compliance Assistant", version="2.0",
-              lifespan=lifespan,
-              # No interactive docs in production: they enumerate the API
-              # surface for anyone who finds the port.
-              docs_url="/docs" if config.DEBUG else None,
-              redoc_url=None,
-              openapi_url="/openapi.json" if config.DEBUG else None)
+app = FastAPI(
+    title="DPDP Compliance Assistant API",
+    version="2.0",
+    lifespan=lifespan,
+    summary="Answers questions about India's DPDP Act, 2023 and Rules, 2025, "
+            "quoting the statute verbatim with every citation verified against "
+            "a knowledge graph.",
+    description=(
+        "All endpoints are JSON except `POST /api/chat`, which streams "
+        "Server-Sent Events.\n\n"
+        "**Authentication** — `/api/chat`, `/api/history` and "
+        "`/api/provision/{node_id}` require a Supabase-issued Google sign-in "
+        "token as `Authorization: Bearer <jwt>`. `/`, `/api/live`, "
+        "`/api/health` and `/api/config` are public so infrastructure probes "
+        "and the frontend's own bootstrap work without a credential.\n\n"
+        "**Answers are informational, not legal advice.** Verify every "
+        "citation against the Act or Rules before relying on it."
+    ),
+    # Docs are on by default and controlled by their own flag — see
+    # config.DOCS_ENABLED for why this no longer rides on DEBUG.
+    docs_url="/docs" if config.DOCS_ENABLED else None,
+    redoc_url="/redoc" if config.DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if config.DOCS_ENABLED else None,
+    openapi_tags=[
+        {"name": "meta", "description": "Service identity, health and public "
+                                        "configuration. No authentication."},
+        {"name": "corpus", "description": "The Act and Rules themselves. "
+                                          "Requires sign-in."},
+    ],
+)
 
 if config.CORS_ORIGINS:
     app.add_middleware(
@@ -101,7 +125,8 @@ if config.CORS_ORIGINS:
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    """Headers that cost nothing and close real classes of attack.
+    """Headers that cost nothing and close real classes of attack, plus the
+    request id that ties a user's report to the logs.
 
     This service serves no HTML — the frontend is a separate service
     (`frontend/server.py`), which carries its own CSP scoped to what a
@@ -111,8 +136,16 @@ async def security_headers(request: Request, call_next):
     so this only sets the headers that still mean something for an API
     response — never rendered, never framed, and any error page a
     downstream proxy generates from this response shouldn't leak a referrer.
+
+    The request id is minted here, once, and put on `request.state` so
+    `/api/chat` records the SAME id in the audit log and in MongoDB that the
+    caller saw in `X-Request-ID`. Before this it minted its own separately,
+    so a user reporting "request abc123 gave a wrong answer" was quoting an
+    id that appeared in no record anywhere.
     """
+    request.state.request_id = audit.AuditLog.new_request_id()
     response = await call_next(request)
+    response.headers.setdefault("X-Request-ID", request.state.request_id)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -123,18 +156,31 @@ async def security_headers(request: Request, call_next):
 async def unhandled(request: Request, exc: Exception) -> JSONResponse:
     """Nothing internal reaches the client. The id ties the user's report to
     the stack trace in the log."""
-    request_id = audit.AuditLog.new_request_id()
+    # getattr, not request.state.request_id: an exception raised *before* the
+    # middleware sets it (or in a path that bypassed it) must still produce a
+    # usable error response rather than an AttributeError inside the handler
+    # that is itself supposed to be the last line of defence.
+    request_id = getattr(request.state, "request_id", None) \
+        or audit.AuditLog.new_request_id()
     log.exception("unhandled error [%s] on %s", request_id, request.url.path)
     detail = str(exc) if config.DEBUG else "internal error"
     return JSONResponse(status_code=500,
-                        content={"error": detail, "request_id": request_id})
+                        content={"error": detail, "request_id": request_id},
+                        headers={"X-Request-ID": request_id})
 
 
 class Question(BaseModel):
     # Bounded before any work happens: an unbounded question becomes an
     # unbounded prompt, which is both a cost and a context-overflow problem.
-    question: str = Field(min_length=2, max_length=800)
-    k: int = Field(default=6, ge=1, le=15)
+    question: str = Field(min_length=2, max_length=800,
+                          description="A plain-English question about the Act "
+                                      "or the Rules.")
+    k: int = Field(default=6, ge=1, le=15,
+                   description="How many provisions to retrieve before "
+                               "answering.")
+
+    model_config = {"json_schema_extra": {"examples": [
+        {"question": "what is the fine if customer data leaks?", "k": 6}]}}
 
     @field_validator("question")
     @classmethod
@@ -146,24 +192,109 @@ class Question(BaseModel):
         return text
 
 
-@app.get("/api/health")
-def health() -> dict:
+class Liveness(BaseModel):
+    status: str = Field(description='Always "alive" if the process answered.')
+    version: str
+
+
+class Health(BaseModel):
+    ok: bool = Field(description="False if the corpus or the model provider "
+                                 "is unavailable. The HTTP status mirrors "
+                                 "this: 200 when true, 503 when false.")
+    detail: str
+    provisions: int
+    chunks: int
+    build_id: str = Field(description="Content hash of the corpus that will "
+                                      "answer. Changes when the Act or Rules "
+                                      "are rebuilt.")
+    tracing_detail: str
+    provider: str
+    model: str
+    abstain_threshold: float
+    max_context_chars: int
+    tracing_enabled: bool
+
+
+class FrontendConfig(BaseModel):
+    supabaseUrl: str
+    supabaseAnonKey: str = Field(description="Public by Supabase's own "
+                                             "design; grants only what "
+                                             "row-level security allows.")
+
+
+class Provision(BaseModel):
+    id: str
+    label: str
+    kind: str
+    headnote: str
+    text: str = Field(description="The instrument's exact words, verbatim.")
+    penalty: str
+    page: int
+
+
+class ServiceInfo(BaseModel):
+    service: str
+    version: str
+    docs: str | None = Field(description="Null when docs are disabled "
+                                         "(DPDP_DOCS=0).")
+
+
+@app.get("/", tags=["meta"], summary="What this service is")
+def root() -> ServiceInfo:
+    """Service identity. Public, cheap, and safe as a platform health-check
+    path — several hosts probe `/` by default, and a 404 there reads as a
+    broken deployment even when the API underneath is fine."""
+    return ServiceInfo(service="dpdp-compliance-assistant-api", version="2.0",
+                       docs="/docs" if config.DOCS_ENABLED else None)
+
+
+@app.get("/api/live", tags=["meta"], summary="Liveness probe")
+def live() -> Liveness:
+    """Is the process up? Nothing else.
+
+    Deliberately separate from `/api/health`: this touches no dependency, so
+    it is safe to poll every few seconds and it answers the only question a
+    *liveness* probe should ask — "should this container be restarted?" A
+    liveness probe that fails because Neo4j is briefly unreachable would
+    restart a perfectly healthy process and fix nothing.
+    """
+    return Liveness(status="alive", version="2.0")
+
+
+@app.get("/api/health", tags=["meta"], summary="Readiness probe",
+         responses={503: {"model": Health,
+                          "description": "Corpus or model provider "
+                                         "unavailable — do not send traffic."}})
+def health(response: Response) -> Health:
+    """Is this instance ready to answer? Checks the corpus and the provider.
+
+    Returns **503 when not ready**, not a 200 carrying `"ok": false`. Load
+    balancers and platform health checks read the status code and ignore the
+    body, so the old always-200 version reported a backend that had lost
+    Neo4j as perfectly healthy and kept it in rotation.
+
+    Use `/api/live` for liveness — this one makes a real call to the model
+    provider and is the wrong thing to poll on a tight loop.
+    """
     graph = STATE.get("graph")
     llm_error = llm.check()
-    return {
-        "ok": llm_error is None and graph is not None,
-        "detail": llm_error or "ready",
-        "provisions": len(graph.provisions) if graph else 0,
-        "chunks": STATE.get("chunk_count", 0),
-        "build_id": graph.build_id if graph else "",
-        "tracing_detail": observability.check() or (
+    ok = llm_error is None and graph is not None
+    if not ok:
+        response.status_code = 503
+    return Health(
+        ok=ok,
+        detail=llm_error or ("ready" if graph else "corpus not loaded"),
+        provisions=len(graph.provisions) if graph else 0,
+        chunks=STATE.get("chunk_count", 0),
+        build_id=graph.build_id if graph else "",
+        tracing_detail=observability.check() or (
             "ready" if config.TRACING_ENABLED else "not configured"),
         **config.public_settings(),
-    }
+    )
 
 
-@app.get("/api/config")
-def frontend_config() -> dict:
+@app.get("/api/config", tags=["meta"], summary="Frontend bootstrap config")
+def frontend_config() -> FrontendConfig:
     """The frontend's own startup config — public, no sign-in required.
 
     Replaces the marker-substitution `render_page()` used to do when this
@@ -174,12 +305,14 @@ def frontend_config() -> dict:
     public here by being added to `config.py`, it has to be added to that
     allow-list explicitly.
     """
-    return config.frontend_config()
+    return FrontendConfig(**config.frontend_config())
 
 
-@app.get("/api/provision/{node_id}")
+@app.get("/api/provision/{node_id}", tags=["corpus"],
+         summary="One provision, verbatim",
+         responses={404: {"description": "No such provision."}})
 def provision(node_id: str,
-              user: auth.Identity = Depends(auth.require_user)) -> dict:
+              user: auth.Identity = Depends(auth.require_user)) -> Provision:
     """Verbatim text of one provision — what a citation click opens.
 
     Behind the same sign-in gate as `/api/chat`: without it the whole corpus
@@ -193,13 +326,19 @@ def provision(node_id: str,
     found = graph.provisions.get(node_id)
     if found is None:
         raise HTTPException(status_code=404, detail="no such provision")
-    return {"id": found.id, "label": found.label, "kind": found.kind,
-            "headnote": found.headnote, "text": found.text,
-            "penalty": found.penalty, "page": found.page}
+    return Provision(id=found.id, label=found.label, kind=found.kind,
+                     headnote=found.headnote, text=found.text,
+                     penalty=found.penalty, page=found.page)
 
 
-@app.get("/api/history")
-def history_list(limit: int = 30, before: str | None = None,
+@app.get("/api/history", tags=["corpus"], summary="Your own past answers",
+         responses={503: {"description": "History store unreachable."}})
+def history_list(limit: int = Query(default=30, ge=1, le=50),
+                 before: str | None = Query(
+                     default=None,
+                     description="ISO-8601 timestamp; returns answers older "
+                                 "than this. Use the oldest `created_at` from "
+                                 "the previous page."),
                  user: auth.Identity = Depends(auth.require_user)) -> list[dict]:
     """A signed-in user's own past answered questions, for the history panel.
 
@@ -209,7 +348,7 @@ def history_list(limit: int = 30, before: str | None = None,
     no endpoint accepts a client-supplied user id.
     """
     try:
-        return mongo.list_for_user(user.sub, min(limit, 50), before)
+        return mongo.list_for_user(user.sub, limit, before)
     except Exception:
         log.exception("history read failed")
         raise HTTPException(status_code=503, detail="could not load history")
@@ -219,13 +358,27 @@ def _sse(event: str, payload: dict) -> dict:
     return {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
 
 
-@app.post("/api/chat")
-async def chat(q: Question,
+@app.post("/api/chat", tags=["corpus"], summary="Ask a question (SSE stream)",
+          response_class=EventSourceResponse,
+          responses={200: {"content": {"text/event-stream": {}},
+                           "description":
+                               "A Server-Sent Events stream. Events arrive in "
+                               "order: `retrieval` (which provisions were "
+                               "found), then either `abstain` (out of scope, "
+                               "no model call spent) or `token`×N (the answer, "
+                               "as produced) followed by `citations` (each one "
+                               "verified against the graph) and `done` "
+                               "(timings, model, build id). `error` replaces "
+                               "the remainder on failure."}})
+async def chat(q: Question, request: Request,
                user: auth.Identity = Depends(auth.require_user)) -> EventSourceResponse:
     graph: graph_store.Graph = STATE["graph"]
     retriever: retrieval.Retriever = STATE["retriever"]
     trail: audit.AuditLog = STATE["audit"]
-    request_id = trail.new_request_id()
+    # The id the caller already saw in this response's X-Request-ID header,
+    # so their bug report, the audit log and the Mongo record all name one id.
+    request_id = getattr(request.state, "request_id", None) \
+        or trail.new_request_id()
     started = time.perf_counter()
 
     def elapsed_ms() -> int:

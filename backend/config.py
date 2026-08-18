@@ -162,6 +162,16 @@ if "*" in CORS_ORIGINS:
 # stack trace or a connection string can never reach a browser.
 DEBUG = _flag("DPDP_DEBUG", False)
 
+# Interactive API docs (/docs) and the OpenAPI schema. Deliberately its OWN
+# flag rather than riding on DEBUG, which it used to: DEBUG leaks internal
+# error detail and must stay off in production, but docs are useful there and
+# leak far less than they appear to. Every endpoint this schema describes is
+# already named in the frontend's own JavaScript, which is public by
+# definition — hiding /docs does not hide the API surface, it only makes it
+# inconvenient to read. Everything sensitive is gated on a verified token,
+# not on the endpoint being unguessable.
+DOCS_ENABLED = _flag("DPDP_DOCS", True)
+
 
 def public_settings() -> dict:
     """The ONLY settings any HTTP response may include.
