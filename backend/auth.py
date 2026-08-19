@@ -71,11 +71,19 @@ def _jwks() -> jwt.PyJWKClient:
 @dataclass(frozen=True)
 class Identity:
     """A verified caller. `sub` is Supabase's stable user id — the only field
-    safe to key usage records on, since a user can change their email."""
+    safe to key usage records on, since a user can change their email.
+
+    `session_id` is Supabase's own `auth.sessions.id` (the `session_id`
+    claim GoTrue puts in every access token) — not a value this service
+    mints. Reusing it is what keeps Supabase, MongoDB and Langfuse in sync
+    for free: one sign-in produces one UUID, and every store that wants to
+    group "this browser session's questions" keys on that same UUID with no
+    new state or handshake required anywhere."""
 
     sub: str
     email: str = ""
     name: str = ""
+    session_id: str = ""
 
 
 def verify(token: str) -> Identity:
@@ -121,6 +129,7 @@ def verify(token: str) -> Identity:
         sub=claims["sub"],
         email=claims.get("email") or metadata.get("email") or "",
         name=metadata.get("full_name") or metadata.get("name") or "",
+        session_id=claims.get("session_id") or "",
     )
 
 

@@ -260,6 +260,9 @@ def live() -> Liveness:
     """
     return Liveness(status="alive", version="2.0")
 
+# @app.get("/health")
+# def health():
+#     return {"status": "ok"}
 
 @app.get("/api/health", tags=["meta"], summary="Readiness probe",
          responses={503: {"model": Health,
@@ -389,7 +392,12 @@ async def chat(q: Question, request: Request,
                 "build_id": graph.build_id,
                 # Identity comes from a verified token, never from the request
                 # body — the caller cannot claim to be someone else.
-                "user_id": user.sub, "email": user.email, "name": user.name}
+                # session_id is Supabase's own auth.sessions.id (see
+                # auth.Identity) — the same value Langfuse groups traces by
+                # below, so a conversation can be followed across all three
+                # stores on one shared UUID.
+                "user_id": user.sub, "email": user.email, "name": user.name,
+                "session_id": user.session_id}
 
         def finish(outcome: str, *, retrieval_payload: dict | None = None,
                    citations_payload: dict | None = None,
@@ -411,6 +419,7 @@ async def chat(q: Question, request: Request,
             trail.write({**base, "outcome": outcome, **extra})
             mongo.record({
                 "user_id": user.sub,
+                "session_id": user.session_id,
                 "email": user.email,
                 "name": user.name,
                 "question": q.question,
@@ -431,6 +440,7 @@ async def chat(q: Question, request: Request,
         # — this function's control flow is identical whether it's on or off.
         with observability.trace(
                 "compliance.answer", input=q.question,
+                user_id=user.sub, session_id=user.session_id,
                 metadata={"request_id": request_id, "k": q.k}) as root:
 
             # 1. Retrieve. Sent immediately: it is fast, and showing the

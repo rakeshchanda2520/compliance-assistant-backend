@@ -105,12 +105,28 @@ def _observation(name: str, as_type: str, **fields):
             log.warning("tracing span close failed", exc_info=True)
 
 
-def trace(name: str, **fields):
+@contextmanager
+def trace(name: str, *, user_id: str = "", session_id: str = "", **fields):
     """Root span for one request. A no-op (yields None) when tracing is off,
     so callers unconditionally write `with observability.trace(...) as t:`
     and guard direct use of `t` behind `if t:` — never behind a separate
-    `if config.TRACING_ENABLED:` scattered through the caller."""
-    return _observation(name, "span", **fields)
+    `if config.TRACING_ENABLED:` scattered through the caller.
+
+    `user_id`/`session_id` are Langfuse's own first-class trace attributes —
+    setting them is what turns the Langfuse UI's Users/Sessions views on,
+    and is what lets "every trace for this user" or "every trace in this
+    sign-in session" be filtered without grepping metadata. Applied via
+    `propagate_attributes()` so every child `step()` opened inside this
+    `with` block inherits them automatically, rather than every call site
+    threading the same two values through by hand.
+    """
+    with _observation(name, "span", **fields) as root:
+        if not config.TRACING_ENABLED or root is None or not (user_id or session_id):
+            yield root
+            return
+        from langfuse import propagate_attributes
+        with propagate_attributes(user_id=user_id or None, session_id=session_id or None):
+            yield root
 
 
 def step(name: str, as_type: str = "span", **fields):

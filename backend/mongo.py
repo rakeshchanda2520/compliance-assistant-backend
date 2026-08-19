@@ -14,10 +14,13 @@ answer later (`/api/history`).
 This content deliberately lives outside Supabase. Supabase Postgres stays
 scoped to identity and login history (`auth.users`, `profiles`,
 `login_events` — see `supabase_setup.sql`); no question or answer text is
-stored there. The two stores correlate on one shared key: `user_id` is
-always `auth.users.id`, the same UUID from the verified JWT's `sub` claim in
-both places — there is only one place a user id is ever minted, so nothing
-has to be done to keep them in sync.
+stored there. The two stores correlate on two shared keys, both minted by
+Supabase and never by this service: `user_id` is always `auth.users.id`,
+and `session_id` is always `auth.sessions.id` (the `session_id` claim in the
+verified JWT — see `auth.Identity`), the same one sign-in that produced a
+`login_events` row. Langfuse traces (`observability.trace()`) carry the
+identical pair, so a user or a single sign-in session can be followed across
+Supabase, MongoDB and Langfuse without any of them talking to each other.
 
 `pymongo` (sync driver), not `motor`. `finish()` in `app.py` already calls
 this from a plain sync function inside an async generator — matching
@@ -52,6 +55,7 @@ try:
     # raise. That is exactly the failure mode `record()` below is designed to
     # never have; index creation must honour the same contract.
     _collection.create_index([("user_id", 1), ("created_at", -1)])
+    _collection.create_index([("session_id", 1), ("created_at", -1)])
     _collection.create_index([("created_at", -1)])
 except PyMongoError as exc:
     # The app still starts and still answers questions — it just runs
