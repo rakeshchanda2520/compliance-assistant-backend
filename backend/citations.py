@@ -137,6 +137,77 @@ def check(answer: str, retrieved_node_ids: set[str], graph: Graph) -> list[Citat
     return sorted(seen.values(), key=lambda c: (STATUS_ORDER[c.status], c.id))
 
 
+def check_structured(claimed: list[dict], retrieved_node_ids: set[str],
+                     graph: Graph) -> list[Citation]:
+    """Verification when the model emitted node ids directly (phase 3).
+
+    The whole point of structured output: this is set membership, not pattern
+    matching. `check()` above has to anticipate every way a model might spell
+    a citation — miss one format and the answer looks unsourced when it was
+    fully sourced. Here there is no format to miss.
+
+    The statuses are unchanged, and `out_of_context` still earns its keep: a
+    model can emit an id it was never shown, and that is precisely a citation
+    recalled from training rather than read from the context.
+    """
+    seen: dict[str, Citation] = {}
+
+    for item in claimed:
+        node_id = (item.get("node_id") or "").strip()
+        if not node_id or node_id in seen:
+            continue
+
+        provision = graph.provisions.get(node_id)
+        if provision is None:
+            parts_ = node_id.split("-")
+            parent = "-".join(parts_[:-1])
+            note = ("no such provision in this corpus"
+                    if len(parts_) <= 2 or parent not in graph.provisions
+                    else f"no such provision; nearest is {label_for(parent)}")
+            seen[node_id] = Citation(node_id, label_for(node_id),
+                                     "unresolved", note=note)
+            continue
+
+        text = provision.text
+        if node_id.startswith("pen-"):
+            text = f"{provision.text}  —  {provision.penalty}".strip(" —")
+
+        verified = _in_context(node_id, retrieved_node_ids)
+        seen[node_id] = Citation(
+            id=node_id,
+            label=label_for(node_id),
+            status="verified" if verified else "out_of_context",
+            text=text.strip(),
+            headnote=provision.headnote,
+            note="" if verified else
+                 "this provision exists but was not retrieved for this question",
+        )
+
+    return sorted(seen.values(), key=lambda c: (STATUS_ORDER[c.status], c.id))
+
+
+def check_template(node_ids: list[str], graph: Graph) -> list[Citation]:
+    """Citations for a template answer.
+
+    Always `verified`, and that is not a shortcut: a template's citations are
+    the nodes the renderer actually read out of the graph, so the provision
+    both exists and was in context by construction. There is no model claim
+    here to doubt.
+    """
+    out: list[Citation] = []
+    for node_id in node_ids:
+        provision = graph.provisions.get(node_id)
+        if provision is None:
+            continue
+        text = provision.text
+        if node_id.startswith("pen-"):
+            text = f"{provision.text}  —  {provision.penalty}".strip(" —")
+        out.append(Citation(id=node_id, label=label_for(node_id),
+                            status="verified", text=text.strip(),
+                            headnote=provision.headnote))
+    return out
+
+
 def penalty_facts(results, graph: Graph) -> list[dict]:
     """Penalty amounts read from the graph, never from the model."""
     duty_of = graph.penalised_by()

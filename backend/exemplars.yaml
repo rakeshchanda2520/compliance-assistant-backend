@@ -1,0 +1,84 @@
+# Labelled example questions for the embedding tier of the router.
+#
+# This file is the human-fixable audit surface for ROUTING, exactly as
+# vocab.yaml is for retrieval. When a question routes wrongly, the trace names
+# the exemplar it matched and the cosine it scored — the fix is to add, move,
+# or delete a line here. That is the property an LLM classifier cannot offer:
+# its misclassification traces to nothing you can edit.
+#
+# Tier 1 (regex, in understanding.py) catches the obvious phrasings.
+# Tier 2 (these exemplars) catches the paraphrases no token set enumerates.
+# Tier 3 is "general" — synthesis. There is deliberately no LLM tier.
+#
+# Keep exemplars SHORT and phrased the way a user actually types. They are
+# embedded with the same model as the corpus, so a long formal sentence
+# matches long formal questions and nothing else.
+
+intents:
+  penalty:
+    - "what is the fine for this"
+    - "how much do we have to pay if we get it wrong"
+    - "what are the financial consequences of non-compliance"
+    - "can the Board impose a monetary penalty on us"
+    - "how expensive is a violation"
+    - "what sanctions apply"
+
+  definition:
+    - "what does this term mean"
+    - "who counts as one of these"
+    - "how is that expression defined"
+    - "explain what this phrase refers to"
+    - "what is the legal meaning of this word"
+
+  retention:
+    - "how long may we hold on to this information"
+    - "when do we have to delete it"
+    - "what is the storage period"
+    - "for how many years can records be kept"
+    - "when does the erasure obligation start"
+
+  obligation:
+    - "what are we required to do"
+    - "what responsibilities do we carry"
+    - "what steps must be taken to comply"
+    - "what does the law require of us here"
+    - "what do we owe the individual"
+    - "are we allowed to do this"
+
+  direct_lookup:
+    - "read me that provision"
+    - "what is the text of it"
+    - "quote the whole thing"
+    - "show me what it says word for word"
+
+  temporal:
+    - "is this in effect yet"
+    - "when does it start applying"
+    - "has it commenced"
+    - "what is the date it becomes binding"
+
+# Foreign-law questions. The V1 gap this closes is specific and documented:
+# GDPR/HIPAA questions score as HIGH as genuine DPDP ones on BM25, because
+# they share real legal vocabulary — so the score threshold cannot catch them
+# and never will. This is a scope judgement, not a confidence judgement.
+jurisdiction:
+  foreign:
+    - "what does European privacy law require"
+    - "under the EU regulation what must a controller do"
+    - "how do American health privacy rules treat this"
+    - "what are the obligations of a data controller in Europe"
+    - "what does the California privacy statute say"
+    - "rules for supervisory authorities in the EU"
+    - "what does the UK regime require for subject access"
+    - "how does Singapore's data protection law handle consent"
+    - "what do Brazilian privacy rules say"
+
+  # Genuinely about this corpus. Present so a DPDP question that happens to
+  # use a word like "controller" is not dragged foreign by one token.
+  domestic:
+    - "what does the DPDP Act require"
+    - "obligations of a Data Fiduciary in India"
+    - "what must we do under the Indian data protection law"
+    - "what does the Board do about a breach"
+    - "penalties under the Indian Act"
+    - "rights of a Data Principal"

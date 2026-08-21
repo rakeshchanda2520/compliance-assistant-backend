@@ -69,6 +69,47 @@ class Graph:
                 out.setdefault(dst, []).append(src)
         return out
 
+    def penalty_for(self) -> dict[str, str]:
+        """Duty -> the Schedule entry that penalises it. The forward direction
+        of `penalised_by`, which the penalty template needs: it starts from a
+        retrieved duty and has to reach the amount."""
+        return {src: dst for src, dst, etype in self.edges
+                if etype == "PENALISED_BY"}
+
+    def children_of(self, node_id: str) -> list[str]:
+        """Direct children, in document order.
+
+        Order matters and is not incidental: `_marker_key` sorts s-8-10 after
+        s-8-9 rather than after s-8-1, which plain string sorting gets wrong
+        the moment a section passes nine sub-sections — and §8 has eleven.
+        """
+        kids = [child for child, parent in self.parent_of.items()
+                if parent == node_id]
+        return sorted(kids, key=_marker_key)
+
+    def descendants_of(self, node_id: str) -> list[str]:
+        """Every node beneath this one, depth-first in document order."""
+        out: list[str] = []
+        for child in self.children_of(node_id):
+            out.append(child)
+            out.extend(self.descendants_of(child))
+        return out
+
+
+def _marker_key(node_id: str) -> tuple:
+    """Sort key that orders document markers the way the document does.
+
+    Numeric parts compare numerically, alphabetic parts alphabetically, so
+    s-8-2 precedes s-8-10 and r-6-1-a precedes r-6-1-b.
+    """
+    key: list = []
+    for part in node_id.split("-"):
+        if part.isdigit():
+            key.append((0, int(part), ""))
+        else:
+            key.append((1, 0, part))
+    return tuple(key)
+
 
 def _driver():
     return GraphDatabase.driver(

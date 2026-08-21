@@ -4,12 +4,16 @@
 # Contains full questions and answers — operational data, not source.
 logs/
 
-# data/chunks.json and data/vocab.yaml ARE committed here — deliberately,
-# unlike the monorepo's own copies. This repo has no kg_build/ and cannot
-# regenerate them; without a copy checked in, there is nothing for the
-# Dockerfile to bake into the image and nothing for the app to serve (this
-# is exactly the failure a hosting platform hits if they're missing:
-# RuntimeError: search index missing at chunks.json).
+# data/chunks.json, data/vocab.yaml, data/embeddings.npz and
+# data/commencement.yaml ARE committed here — deliberately, unlike the
+# monorepo's own copies. This repo has no kg_build/ and cannot regenerate
+# them; without a copy checked in, there is nothing for the Dockerfile to
+# bake into the image and nothing for the app to serve (this is exactly the
+# failure a hosting platform hits if they're missing: RuntimeError: search
+# index missing at chunks.json). embeddings.npz in particular must be the
+# EXACT one built alongside the committed chunks.json — app.py refuses to
+# start if they disagree, or if embeddings.npz carries vectors from a
+# different embedding model than DPDP_EMBED_PROVIDER/DPDP_EMBED_MODEL name.
 #
 # in the monorepo checkout, backend/logs is a directory JUNCTION (Windows)
 # pointing at the real Compliance-Assistant-level logs/ — see the setup note

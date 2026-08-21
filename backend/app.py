@@ -38,8 +38,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
-from . import (audit, auth, citations, config, graph_store, llm, mongo,
-               observability, retrieval)
+from . import (audit, auth, citations, config, dense, embeddings, graph_store,
+               llm, mongo, numeric, observability, ratelimit, retrieval,
+               schema, streaming, templates, temporal, understanding)
 from .indexing import load_chunks
 from .prompt import SYSTEM_PROMPT
 
@@ -58,14 +59,56 @@ async def lifespan(app: FastAPI):
     chunks = load_chunks(config.DATA_DIR / "chunks.json")
     vocab = yaml.safe_load((config.DATA_DIR / "vocab.yaml").read_text(encoding="utf-8"))
 
+    # Raises when DPDP_HYBRID=1 but the index is missing or was built by a
+    # different embedding model — see dense.load / embeddings.verify_fingerprint.
+    # Serving on mismatched vectors returns confident nonsense with no other
+    # symptom, so this is one of the few things worth refusing to start over.
+    dense_index = dense.load(config.DATA_DIR / "embeddings.npz")
+
+    # Corpus integrity. `backend/data/chunks.json` is a MANUAL copy of the
+    # kg_build output (the backend deploys as its own repo, with no access to
+    # kg_build and no shared filesystem), so the one failure this deployment
+    # genuinely invites is a stale copy: a graph rebuilt in Neo4j while the
+    # shipped chunks still describe the previous corpus. Retrieval would then
+    # score text that no longer matches the provisions being cited, and
+    # nothing else in the system would notice.
+    orphans = {c.node_id for c in chunks} - set(graph.provisions)
+    if orphans:
+        raise RuntimeError(
+            f"chunks.json is out of step with Neo4j: {len(orphans)} chunk(s) "
+            f"reference provisions that no longer exist "
+            f"(e.g. {sorted(orphans)[:5]}). The graph was rebuilt without "
+            f"copying the new chunks. Run `python -m kg_build --neo4j --embed` "
+            f"then `cp data/chunks.json data/embeddings.npz backend/data/`.")
+
+    if dense_index is not None:
+        drift = set(dense_index.node_ids) ^ {c.node_id for c in chunks}
+        if drift:
+            raise RuntimeError(
+                f"embeddings.npz does not match chunks.json: {len(drift)} "
+                f"node(s) differ (e.g. {sorted(drift)[:5]}). Both are written "
+                f"by the same build — copy them together, and rebuild with "
+                f"`python -m kg_build --embed` if either changed.")
+
     STATE["graph"] = graph
-    STATE["retriever"] = retrieval.Retriever(chunks, graph, vocab)
+    STATE["retriever"] = retrieval.Retriever(chunks, graph, vocab, dense_index)
     STATE["audit"] = audit.AuditLog(config.LOG_DIR)
     STATE["chunk_count"] = len(chunks)
+    STATE["limiter"] = ratelimit.RateLimiter()
+    STATE["commencement"] = temporal.load(config.DATA_DIR / "commencement.yaml")
+
+    classifier = understanding.Classifier()
+    # Uses the exemplar vectors cached in the dense index, so a restart costs
+    # no embedding requests. Degrades to the regex tier on failure.
+    classifier.warm(dense_index)
+    STATE["classifier"] = classifier
 
     log.info("ready: %d provisions, %d chunks, build %s, model %s/%s",
              len(graph.provisions), len(chunks), graph.build_id,
              config.PROVIDER, config.MODEL)
+    log.info("v2 features: hybrid=%s router=%s structured=%s numeric=%s "
+             "conversations=%s", config.HYBRID, config.INTENT_ROUTER,
+             config.STRUCTURED_OUTPUT, config.NUMERIC_CHECK, config.CONVERSATIONS)
     if llm.is_small_model():
         log.warning("%s is a small model; it has misread statute in this "
                     "corpus. Prefer a larger model for real use.", config.MODEL)
@@ -178,9 +221,30 @@ class Question(BaseModel):
     k: int = Field(default=6, ge=1, le=15,
                    description="How many provisions to retrieve before "
                                "answering.")
+    conversation_id: str | None = Field(
+        default=None, max_length=64,
+        description="Groups turns of one conversation. Prior turns contribute "
+                    "their questions and provision ids as extra retrieval "
+                    "seeds — never their answers.")
+    as_of: str | None = Field(
+        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="ISO date. Provisions are flagged in force or not as of "
+                    "this date. Defaults to today.")
 
     model_config = {"json_schema_extra": {"examples": [
         {"question": "what is the fine if customer data leaks?", "k": 6}]}}
+
+    @field_validator("conversation_id")
+    @classmethod
+    def clean_conversation_id(cls, value: str | None) -> str | None:
+        """Opaque to us, but it reaches a Mongo query — so constrain it to
+        characters that cannot carry structure. Reads are scoped to the
+        caller's own user id as well (see mongo.recent_turns), so this is
+        defence in depth rather than the only guard."""
+        if value is None:
+            return None
+        cleaned = "".join(ch for ch in value if ch.isalnum() or ch in "-_")
+        return cleaned or None
 
     @field_validator("question")
     @classmethod
@@ -213,6 +277,14 @@ class Health(BaseModel):
     abstain_threshold: float
     max_context_chars: int
     tracing_enabled: bool
+    features: dict = Field(description="Which V2 paths are live.")
+    embed_model: str = ""
+    embedding_detail: str = Field(
+        default="", description="Empty when hybrid retrieval is off.")
+    dense_vectors: int = 0
+    rate_limit_scope: str = Field(
+        default="", description='"process" — the limiter is in-memory and '
+                                'does not coordinate across instances.')
 
 
 class FrontendConfig(BaseModel):
@@ -281,6 +353,12 @@ def health(response: Response) -> Health:
     """
     graph = STATE.get("graph")
     llm_error = llm.check()
+    # Hybrid is degradable, not fatal: retrieval.  _seed falls back to BM25
+    # when the embedder is unreachable, so an embedding outage lowers answer
+    # quality but must not take the instance out of rotation.
+    embed_error = embeddings.check() if config.HYBRID else None
+    index = getattr(STATE.get("retriever"), "dense_index", None)
+
     ok = llm_error is None and graph is not None
     if not ok:
         response.status_code = 503
@@ -292,6 +370,10 @@ def health(response: Response) -> Health:
         build_id=graph.build_id if graph else "",
         tracing_detail=observability.check() or (
             "ready" if config.TRACING_ENABLED else "not configured"),
+        embedding_detail=embed_error or (
+            "ready" if config.HYBRID else "not configured"),
+        dense_vectors=len(index) if index else 0,
+        rate_limit_scope="process" if config.RATE_LIMIT > 0 else "disabled",
         **config.public_settings(),
     )
 
@@ -361,6 +443,71 @@ def _sse(event: str, payload: dict) -> dict:
     return {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
 
 
+async def _stream_template(rendered, graph, results, plan, commencement,
+                           as_of, elapsed_ms, finish, router_payload, root,
+                           retrieval_payload):
+    """Emit a template answer over the SAME event sequence as a model answer.
+
+    It streams rather than arriving whole, and that is a deliberate cost: the
+    text is already in memory, so this is pure UX. A UI that is instant for
+    penalty questions and progressive for everything else reads as broken
+    rather than fast, and the frontend would need a second rendering path to
+    handle it.
+    """
+    for piece in rendered.chunks():
+        yield _sse("token", {"t": piece})
+
+    checked = citations.check_template(rendered.citations, graph)
+    penalties = citations.penalty_facts(results, graph)
+    citations_payload = {"citations": [c.to_dict() for c in checked],
+                         "penalties": penalties}
+    yield _sse("citations", citations_payload)
+
+    # No numeric check here, and not an omission: every figure came out of
+    # Provision.penalty or a verbatim text field, so it is sourced by
+    # construction. Checking would only manufacture false positives from
+    # formatting differences.
+    claims_payload: list = []
+
+    stale = commencement.not_yet_in_force(rendered.citations, as_of)
+    if stale:
+        claims_payload.append({
+            "claim": "commencement",
+            "verdict": "not_yet_in_force",
+            "note": f"as of {as_of.isoformat()}, "
+                    + ", ".join(citations.label_for(n) for n in stale)
+                    + " has not commenced"})
+    if plan.caveat:
+        claims_payload.append({"claim": "scope", "verdict": "caveat",
+                               "note": plan.caveat})
+    if claims_payload:
+        yield _sse("claims", claims_payload)
+
+    done_payload = {
+        "elapsed_ms": elapsed_ms(),
+        "model": None,                 # explicitly: no model was involved
+        "provider": "template",
+        "path": "template",
+        "intent": plan.intent,
+        "build_id": graph.build_id,
+        "context_chars": 0,
+        "as_of": as_of.isoformat(),
+    }
+    yield _sse("done", done_payload)
+
+    if root:
+        root.update(output=rendered.text,
+                    metadata={"path": "template", "intent": plan.intent})
+    observability.flush()
+
+    finish("answered", answer=rendered.text, intent=plan.intent,
+           model=None, provider="template", elapsed_ms=elapsed_ms(),
+           context_chars=0, router=router_payload, claims=claims_payload,
+           citations=[c.to_dict() for c in checked],
+           retrieval_payload=retrieval_payload,
+           citations_payload=citations_payload, done_payload=done_payload)
+
+
 @app.post("/api/chat", tags=["corpus"], summary="Ask a question (SSE stream)",
           response_class=EventSourceResponse,
           responses={200: {"content": {"text/event-stream": {}},
@@ -378,6 +525,24 @@ async def chat(q: Question, request: Request,
     graph: graph_store.Graph = STATE["graph"]
     retriever: retrieval.Retriever = STATE["retriever"]
     trail: audit.AuditLog = STATE["audit"]
+    limiter: ratelimit.RateLimiter = STATE["limiter"]
+    commencement: temporal.Commencement = STATE["commencement"]
+    classifier: understanding.Classifier = STATE["classifier"]
+
+    # Before any work, and before the stream opens: a 429 delivered as an SSE
+    # error event would be invisible to anything that reads status codes, and
+    # a rate limiter that costs a retrieval pass to enforce is a poor one.
+    allowed, remaining, retry_after = limiter.allow(user.sub)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit reached ({config.RATE_LIMIT} questions per "
+                   f"hour). Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after),
+                     "RateLimit-Limit": str(config.RATE_LIMIT),
+                     "RateLimit-Remaining": "0"})
+
+    as_of = temporal.resolve_as_of(q.as_of, config.AS_OF_DEFAULT)
     # The id the caller already saw in this response's X-Request-ID header,
     # so their bug report, the audit log and the Mongo record all name one id.
     request_id = getattr(request.state, "request_id", None) \
@@ -397,7 +562,9 @@ async def chat(q: Question, request: Request,
                 # below, so a conversation can be followed across all three
                 # stores on one shared UUID.
                 "user_id": user.sub, "email": user.email, "name": user.name,
-                "session_id": user.session_id}
+                "session_id": user.session_id,
+                "conversation_id": q.conversation_id or "",
+                "as_of": as_of.isoformat()}
 
         def finish(outcome: str, *, retrieval_payload: dict | None = None,
                    citations_payload: dict | None = None,
@@ -420,6 +587,7 @@ async def chat(q: Question, request: Request,
             mongo.record({
                 "user_id": user.sub,
                 "session_id": user.session_id,
+                "conversation_id": q.conversation_id or "",
                 "email": user.email,
                 "name": user.name,
                 "question": q.question,
@@ -428,9 +596,18 @@ async def chat(q: Question, request: Request,
                 "retrieval": retrieval_payload,
                 "citations": citations_payload,
                 "done": done_payload,
+                "router": extra.get("router"),
+                "claims": extra.get("claims"),
                 "elapsed_ms": elapsed_ms(),
                 "build_id": graph.build_id,
             })
+            # The conversation turn carries the question and the provisions it
+            # reached — never the answer. See mongo.record_turn for why.
+            if config.CONVERSATIONS and q.conversation_id:
+                mongo.record_turn(
+                    q.conversation_id, user.sub, q.question,
+                    [p["id"] for p in (retrieval_payload or {}).get("provisions", [])],
+                    extra.get("intent", ""))
 
         # One Langfuse trace per request, with a child observation per stage
         # — the same three stages as the SSE events above and the fields
@@ -443,20 +620,80 @@ async def chat(q: Question, request: Request,
                 user_id=user.sub, session_id=user.session_id,
                 metadata={"request_id": request_id, "k": q.k}) as root:
 
+            # 0. Understand the question before retrieving anything.
+            #    The query vector is computed ONCE here and reused for both
+            #    routing and dense retrieval — with a hosted embedder that is
+            #    a ~1s call, and paying it twice per question would be the
+            #    single most expensive mistake available in this file.
+            query_vector = None
+            if config.INTENT_ROUTER or config.HYBRID:
+                try:
+                    query_vector = await asyncio.to_thread(
+                        embeddings.embed_one, q.question, True)
+                except Exception as exc:               # noqa: BLE001
+                    log.warning("query embedding unavailable: %s", exc)
+
+            plan = await asyncio.to_thread(
+                understanding.understand, q.question, classifier, query_vector)
+
+            router_payload = {
+                "path": "template" if plan.uses_template else "llm",
+                **plan.to_dict(),
+            }
+
+            # 0a. Foreign jurisdiction. Refused BEFORE retrieval — this is the
+            #     documented V1 gap: a GDPR question scores as high on BM25 as
+            #     a genuine one, so no score threshold can catch it. It is a
+            #     scope judgement, not a confidence one.
+            if plan.should_abstain:
+                router_payload["path"] = "abstain"
+                yield _sse("router", router_payload)
+                finish("out_of_jurisdiction", intent=plan.intent,
+                       router=router_payload,
+                       reason=f"markers: {plan.jurisdiction_markers}")
+                if root:
+                    root.update(output="out_of_jurisdiction", level="WARNING")
+                observability.flush()
+                yield _sse("abstain", {
+                    "message": "That question is about a different privacy "
+                               "regime. This assistant only covers India's "
+                               "Digital Personal Data Protection Act, 2023 and "
+                               "its Rules, 2025.",
+                    "reason": "out of jurisdiction: "
+                              + ", ".join(plan.jurisdiction_markers or ["foreign law"])})
+                return
+
+            yield _sse("router", router_payload)
+
+            # 0b. Prior turns contribute provisions, never prose.
+            prior_ids: list[str] = []
+            if config.CONVERSATIONS and q.conversation_id:
+                turns = await asyncio.to_thread(
+                    mongo.recent_turns, q.conversation_id, user.sub, 3)
+                # Only when the question cannot stand alone. A self-contained
+                # follow-up should retrieve on its own merits, or turn 3 keeps
+                # dragging turn 1's provisions into an unrelated answer.
+                if plan.has_anaphora:
+                    prior_ids = [pid for t in turns for pid in t["provision_ids"]][:6]
+
             # 1. Retrieve. Sent immediately: it is fast, and showing the
             #    evidence before the argument is the whole trust model.
             with observability.step("retrieve", as_type="retriever",
                                     input=q.question) as retr_span:
                 results, trace = await asyncio.to_thread(
-                    retriever.retrieve, q.question, q.k)
+                    retriever.retrieve, q.question, q.k, prior_ids)
                 if retr_span:
                     retr_span.update(
                         output=[r.chunk.node_id for r in results],
                         metadata={"vocab_hits": trace.vocab_hits,
-                                 "intents": trace.intents})
+                                 "intents": trace.intents,
+                                 "fused": trace.fused,
+                                 "intent": plan.intent})
 
-            if not results:
-                finish("no_results")
+            # A direct lookup names its own provision, so an empty BM25 result
+            # is irrelevant — the graph still has the node.
+            if not results and not plan.provision_id:
+                finish("no_results", intent=plan.intent, router=router_payload)
                 if root:
                     root.update(output="no_results", level="WARNING")
                 observability.flush()
@@ -470,13 +707,45 @@ async def chat(q: Question, request: Request,
                 "build_id": graph.build_id,
                 "vocabulary": trace.vocab_hits,
                 "intents": trace.intents,
+                "as_of": as_of.isoformat(),
+                # Dense scores are surfaced, not hidden. V1's case for
+                # vocab.yaml over embeddings was auditability; the honest
+                # answer to "dense is a black box" is to show its working,
+                # so a wrong dense hit is as inspectable as a wrong vocab hit.
+                "fused": trace.fused,
+                "dense_error": trace.dense_error,
                 "provisions": [{
                     "id": r.chunk.node_id, "label": r.chunk.label, "kind": r.chunk.kind,
                     "headnote": r.chunk.headnote, "hop": r.hop,
                     "score": r.score, "via": r.via,
+                    "bm25_rank": trace.bm25_ranks.get(r.chunk.node_id),
+                    "dense_rank": trace.dense_ranks.get(r.chunk.node_id),
+                    "dense_score": trace.dense_scores.get(r.chunk.node_id),
+                    **commencement.annotate(r.chunk.node_id, as_of),
                 } for r in results],
             }
             yield _sse("retrieval", retrieval_payload)
+
+            # 1a. TEMPLATE PATH — the highest-value part of V2. Both errors
+            #     this project has on record happened on questions whose
+            #     answers were already structured data in the graph. Rendering
+            #     them removes the model, and with it the failure mode.
+            if plan.uses_template:
+                rendered = await asyncio.to_thread(
+                    templates.render, plan.intent, results, graph,
+                    plan.provision_id)
+                if rendered is not None:
+                    async for event in _stream_template(
+                            rendered, graph, results, plan, commencement,
+                            as_of, elapsed_ms, finish, router_payload, root,
+                            retrieval_payload):
+                        yield event
+                    return
+                # The graph could not actually support the intent; fall
+                # through to synthesis rather than render a guess.
+                log.info("template %r declined; using synthesis", plan.intent)
+                router_payload["path"] = "llm"
+                router_payload["template_declined"] = True
 
             # 2. Abstain before spending a generation call on an out-of-scope
             #    question — deterministic, not left to the model's judgement.
@@ -505,13 +774,37 @@ async def chat(q: Question, request: Request,
             #    and feeds this coroutine through a queue, so the event loop
             #    keeps serving other requests while one answer streams.
             context = retrieval.build_context(results, config.MAX_CONTEXT_CHARS)
-            prompt = f"{context}\n\nQuestion: {q.question}"
+            # Node ids are given to the model explicitly so structured output
+            # can cite by id. Without this the model has labels ("section
+            # 8(5)") but not the ids the verifier checks membership against.
+            id_list = "\n".join(
+                f"  {r.chunk.node_id}  = {r.chunk.label}" for r in results)
+            prompt = (f"{context}\n\nProvision ids you may cite:\n{id_list}"
+                      f"\n\nQuestion: {q.question}")
+
+            use_large = llm.needs_large_model(q.question, len(results), plan.intent)
+            active_model = llm.model_name(use_large)
+            router_payload.update({"model": active_model,
+                                   "large": use_large,
+                                   "structured": config.STRUCTURED_OUTPUT})
+
+            system = SYSTEM_PROMPT
+            if config.STRUCTURED_OUTPUT:
+                system = f"{SYSTEM_PROMPT}\n{schema.STRUCTURED_INSTRUCTION}"
+
             queue: asyncio.Queue = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
             def produce() -> None:
                 try:
-                    for fragment in llm.stream(prompt, SYSTEM_PROMPT):
+                    if config.STRUCTURED_OUTPUT:
+                        source = llm.stream_structured(
+                            prompt, system, schema.json_schema(), large=use_large)
+                    elif use_large:
+                        source = llm.large_provider().stream(prompt, system, 0.1)
+                    else:
+                        source = llm.stream(prompt, system)
+                    for fragment in source:
                         loop.call_soon_threadsafe(queue.put_nowait, ("token", fragment))
                 except llm.LLMError as exc:
                     loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
@@ -523,16 +816,23 @@ async def chat(q: Question, request: Request,
                     loop.call_soon_threadsafe(queue.put_nowait, ("eof", None))
 
             with observability.step("generate", as_type="generation",
-                                    model=config.MODEL, input=prompt) as gen_span:
+                                    model=active_model, input=prompt) as gen_span:
                 loop.run_in_executor(None, produce)
 
+                # Extracts the `answer` field out of the JSON prefix as it
+                # arrives, so structured output still streams token by token.
+                # See streaming.py — this is what keeps V2 from regressing the
+                # one thing V1's UX got right.
+                extractor = streaming.AnswerStream()
                 parts: list[str] = []
+
                 while True:
                     kind, payload = await queue.get()
                     if kind == "eof":
                         break
                     if kind == "error":
                         finish("generation_error", error=payload,
+                              intent=plan.intent, router=router_payload,
                               retrieval_payload=retrieval_payload)
                         if gen_span:
                             gen_span.update(level="ERROR", status_message=payload)
@@ -542,10 +842,37 @@ async def chat(q: Question, request: Request,
                         observability.flush()
                         yield _sse("error", {"message": payload})
                         return
-                    parts.append(payload)
-                    yield _sse("token", {"t": payload})
 
-                answer = "".join(parts)
+                    if config.STRUCTURED_OUTPUT:
+                        for piece in extractor.feed(payload):
+                            parts.append(piece)
+                            yield _sse("token", {"t": piece})
+                    else:
+                        parts.append(payload)
+                        yield _sse("token", {"t": payload})
+
+                if config.STRUCTURED_OUTPUT:
+                    parsed = extractor.finish()
+                    answer = parsed["answer"]
+                    claimed_citations = parsed["citations"]
+                    structured_ok = parsed["structured"]
+                    if not structured_ok:
+                        # The model ignored the schema. Degrade to the V1
+                        # regex path rather than lose an answer it did produce.
+                        router_payload["structured_failed"] = True
+                        log.warning("structured output failed [%s]; using "
+                                    "regex citation path", request_id)
+                        # Anything not already streamed still has to reach the
+                        # client, or the user sees a truncated answer.
+                        remainder = answer[len("".join(parts)):] \
+                            if answer.startswith("".join(parts)) else answer
+                        if remainder:
+                            yield _sse("token", {"t": remainder})
+                else:
+                    answer = "".join(parts)
+                    claimed_citations = []
+                    structured_ok = False
+
                 if gen_span:
                     gen_span.update(output=answer)
 
@@ -553,7 +880,13 @@ async def chat(q: Question, request: Request,
             with observability.step("verify_citations", as_type="evaluator",
                                     input=answer) as verify_span:
                 retrieved_ids = {r.chunk.node_id for r in results}
-                checked = citations.check(answer, retrieved_ids, graph)
+                # Set membership when the model emitted ids, regex otherwise.
+                # The structured path cannot be defeated by citation phrasing;
+                # the regex path is kept as a live fallback, not as legacy.
+                checked = (citations.check_structured(
+                               claimed_citations, retrieved_ids, graph)
+                           if structured_ok and claimed_citations
+                           else citations.check(answer, retrieved_ids, graph))
                 penalties = citations.penalty_facts(results, graph)
                 if verify_span:
                     verify_span.update(
@@ -564,24 +897,66 @@ async def chat(q: Question, request: Request,
                 "penalties": penalties}
             yield _sse("citations", citations_payload)
 
+            # 5. Every number in the answer must exist in the evidence.
+            #    Deterministic, and what actually catches the Schedule-figure
+            #    class of error — no NLI model required.
+            claims_payload: list = []
+            if config.NUMERIC_CHECK:
+                evidence = [r.chunk.verbatim for r in results]
+                amounts = [graph.provisions[r.chunk.node_id].penalty
+                           for r in results
+                           if r.chunk.node_id in graph.provisions
+                           and graph.provisions[r.chunk.node_id].penalty]
+                numeric_claims = await asyncio.to_thread(
+                    numeric.check, answer, evidence, amounts, q.question)
+                claims_payload.extend(c.to_dict() for c in numeric_claims)
+                if numeric.has_contradiction(numeric_claims):
+                    log.warning("unsupported figure in answer [%s]: %s",
+                                request_id,
+                                [c.surface for c in numeric_claims
+                                 if c.verdict == "unsupported"])
+
+            stale = commencement.not_yet_in_force(
+                [c.id for c in checked], as_of)
+            if stale:
+                claims_payload.append({
+                    "claim": "commencement", "verdict": "not_yet_in_force",
+                    "note": f"as of {as_of.isoformat()}, "
+                            + ", ".join(citations.label_for(n) for n in stale)
+                            + " has not commenced"})
+            if plan.caveat:
+                claims_payload.append({"claim": "scope", "verdict": "caveat",
+                                       "note": plan.caveat})
+            if claims_payload:
+                yield _sse("claims", claims_payload)
+
             done_payload = {
                 "elapsed_ms": elapsed_ms(),
-                "model": config.MODEL,
-                "provider": config.PROVIDER,
+                "model": active_model,
+                "provider": config.LARGE_PROVIDER if use_large else config.PROVIDER,
+                "path": "llm",
+                "intent": plan.intent,
+                "structured": structured_ok,
                 "build_id": graph.build_id,
+                "as_of": as_of.isoformat(),
                 "context_chars": len(prompt)}
             yield _sse("done", done_payload)
 
             if root:
                 root.update(output=answer, metadata={
                     "citation_statuses": [c.status for c in checked],
+                    "path": "llm", "intent": plan.intent,
+                    "model": active_model, "structured": structured_ok,
                     "elapsed_ms": elapsed_ms()})
             observability.flush()
 
             finish(
                 "answered",
-                model=config.MODEL,
-                provider=config.PROVIDER,
+                model=active_model,
+                provider=config.LARGE_PROVIDER if use_large else config.PROVIDER,
+                intent=plan.intent,
+                router=router_payload,
+                claims=claims_payload,
                 elapsed_ms=elapsed_ms(),
                 context_chars=len(prompt),
                 retrieved=[{"id": r.chunk.node_id, "hop": r.hop, "score": r.score}
