@@ -86,8 +86,85 @@ MODEL = _env("DPDP_MODEL") or _DEFAULT_MODEL.get(PROVIDER, _DEFAULT_MODEL["ollam
 NUM_CTX = _int("DPDP_NUM_CTX", 16384)
 LLM_TIMEOUT = _int("DPDP_LLM_TIMEOUT", 600)
 
+# --- Model routing (V2 phase 3) -------------------------------------------- #
+# The 3B default produced BOTH errors this project has on record (a misread
+# Schedule figure, a wrong reading of s.14). Rather than make every question
+# pay for a large model, complexity decides: templates need no model at all,
+# simple synthesis uses the local/default one, and genuinely compound
+# questions go to the larger one. See llm.route_for().
+LARGE_PROVIDER = _env("DPDP_LARGE_PROVIDER", "openrouter").lower()
+LARGE_MODEL = _env("DPDP_LARGE_MODEL", "openai/gpt-4o-mini")
+FORCE_LARGE = _flag("DPDP_FORCE_LARGE", False)
+
+# --- Embeddings (V2 phase 1) ----------------------------------------------- #
+# Dense retrieval is fused with BM25, never replacing it: BM25 is what keeps
+# "250 crore" from blurring into "200 crore", which embeddings measurably do.
+#
+# Two providers, same interface as llm.py, chosen by DPDP_EMBED_PROVIDER:
+#   openrouter  hosted. No RAM cost, no model download. ~1s per query and a
+#               free-tier daily cap — measured, see V2_PLAN.md 2.4.
+#   local       fastembed/ONNX. ~5-15ms, no quota, ~40-60MB RSS. NEVER
+#               sentence-transformers: `import torch` alone costs +168MB RSS,
+#               measured, which does not fit a 512MB free tier.
+#
+# CRITICAL: build time and query time must use the SAME provider and model.
+# Cosine similarity between vectors from different models is meaningless, and
+# nothing detects it — retrieval just quietly degrades. embeddings.npy carries
+# a canary (see kg_build/embed.py) and startup refuses a mismatch.
+EMBED_PROVIDER = _env("DPDP_EMBED_PROVIDER", "openrouter").lower()
+_DEFAULT_EMBED_MODEL = {
+    "openrouter": "liquid/lfm-2.5-embedding-350m:free",
+    "local": "BAAI/bge-small-en-v1.5",
+}
+EMBED_MODEL = _env("DPDP_EMBED_MODEL") or _DEFAULT_EMBED_MODEL.get(
+    EMBED_PROVIDER, _DEFAULT_EMBED_MODEL["openrouter"])
+EMBED_TIMEOUT = _int("DPDP_EMBED_TIMEOUT", 60)
+# Embedding models cap their input. LFM2.5-Embedding-350M rejects anything
+# over 512 tokens outright (measured: a 5,992-char chunk is ~1,350 tokens, so
+# roughly 4.4 chars/token on this corpus's legal prose). 1800 chars leaves
+# real headroom, since punctuation-dense statutory text tokenises worse than
+# the average. See Chunk.embedding_text for what gets kept when it does not fit.
+EMBED_MAX_CHARS = _int("DPDP_EMBED_MAX_CHARS", 1800)
+# bge-family models want this prefix on QUERIES (never on passages) or recall
+# measurably drops. Empty for models that do not use one.
+EMBED_QUERY_PREFIX = _env(
+    "DPDP_EMBED_QUERY_PREFIX",
+    "Represent this sentence for searching relevant passages: "
+    if EMBED_PROVIDER == "local" else "")
+
 # --- Retrieval ------------------------------------------------------------- #
 MAX_CONTEXT_CHARS = _int("DPDP_MAX_CONTEXT_CHARS", 10000)
+
+# V2 feature flags. Each phase is independently reversible: flag off restores
+# exactly the V1 path, so a regression can be bisected to one phase.
+HYBRID = _flag("DPDP_HYBRID", True)              # phase 1: dense + RRF
+INTENT_ROUTER = _flag("DPDP_INTENT_ROUTER", True)  # phase 2: gate/router/templates
+STRUCTURED_OUTPUT = _flag("DPDP_STRUCTURED_OUTPUT", True)  # phase 3
+NUMERIC_CHECK = _flag("DPDP_NUMERIC_CHECK", True)   # phase 4
+CONVERSATIONS = _flag("DPDP_CONVERSATIONS", True)   # phase 5
+VERIFY_CLAIMS = _flag("DPDP_VERIFY_CLAIMS", False)  # phase 9, off: CPU-heavy
+
+# RRF constant from the original paper. Rank-based, so BM25's unbounded
+# scores and cosine's [-1,1] never have to be normalised against each other.
+RRF_K = _int("DPDP_RRF_K", 60)
+# vocab.yaml demoted from query expansion to a score boost (V2_PLAN.md 1.3).
+# Boost rather than expansion so the ON/OFF ablation is interpretable —
+# expansion changes what BM25 scores, which confounds the measurement.
+VOCAB_BOOST = float(_env("DPDP_VOCAB_BOOST", "1.5"))
+
+# --- Rate limiting (V2 phase 6) --------------------------------------------- #
+# In-memory, per-process. Does NOT survive a restart and does NOT coordinate
+# across instances — deliberate: Redis is paid infrastructure this does not
+# need yet. Closes the "sign-in makes abuse attributable, not impossible" gap.
+RATE_LIMIT = _int("DPDP_RATE_LIMIT", 30)          # requests per user per hour
+RATE_WINDOW = _int("DPDP_RATE_WINDOW", 3600)
+
+# --- Temporal validity (V2 phase 7) ----------------------------------------- #
+# Staged commencement is real: rules 1, 2 and 17-21 are in force on
+# publication, rule 4 after a year, the rest after eighteen months. Without
+# this, "is rule 4 in force?" is a reading-comprehension question put to a
+# language model instead of a date comparison.
+AS_OF_DEFAULT = _env("DPDP_AS_OF_DEFAULT", "today")
 # Below this BM25 score the corpus contains nothing resembling an answer.
 # Calibrated against out-of-scope probes: clearly unrelated questions score
 # 7-12, genuine ones 22-85. It catches the obvious end only — questions from
@@ -185,6 +262,19 @@ def public_settings() -> dict:
         "abstain_threshold": ABSTAIN_THRESHOLD,
         "max_context_chars": MAX_CONTEXT_CHARS,
         "tracing_enabled": TRACING_ENABLED,
+        # Which V2 paths are live. Named capabilities, not credentials — the
+        # frontend renders differently when routing is on, and a bug report
+        # that says "hybrid was off" is worth far more than one that doesn't.
+        "features": {
+            "hybrid": HYBRID,
+            "intent_router": INTENT_ROUTER,
+            "structured_output": STRUCTURED_OUTPUT,
+            "numeric_check": NUMERIC_CHECK,
+            "conversations": CONVERSATIONS,
+            "verify_claims": VERIFY_CLAIMS,
+        },
+        # The model id only. EMBED_PROVIDER's key never appears anywhere.
+        "embed_model": EMBED_MODEL if HYBRID else "",
     }
 
 

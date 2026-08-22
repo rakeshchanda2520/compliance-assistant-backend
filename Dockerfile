@@ -12,15 +12,22 @@
 # /api/* only, and expects DPDP_CORS_ORIGINS to name wherever the frontend
 # is actually deployed, or the browser blocks every request from reaching it.
 #
-# data/chunks.json and data/vocab.yaml are BAKED INTO THIS IMAGE (see the
-# COPY below) — committed to this repo, not derived at build time (this repo
-# has no kg_build/ to derive them with). This was tried the other way first
-# (mounted as a volume, nothing copied in) and it fails exactly the way
-# you'd expect on a real hosting platform with no shared filesystem to the
-# monorepo: `RuntimeError: search index missing at chunks.json` on every
-# boot. The trade-off this accepts: the corpus only updates on a rebuild, not
-# automatically. When the source PDFs change and `python -m kg_build` is
-# re-run in the monorepo, `data/chunks.json` here needs a fresh copy and a
+# data/chunks.json, data/vocab.yaml, data/embeddings.npz and
+# data/commencement.yaml are BAKED INTO THIS IMAGE (see the COPY below) —
+# committed to this repo, not derived at build time (this repo has no
+# kg_build/ to derive them with). embeddings.npz is the dense retrieval
+# index built by `python -m kg_build --embed`; app.py refuses to start if it
+# doesn't match chunks.json (see backend/backend/app.py's lifespan) or if it
+# carries vectors from a different embedding model — a stale copy of any one
+# of these four files is a startup failure now, not a silent drift. This was
+# tried the other way first (mounted as a volume, nothing copied in) and it
+# fails exactly the way you'd expect on a real hosting platform with no
+# shared filesystem to the monorepo: `RuntimeError: search index missing at
+# chunks.json` on every boot. The trade-off this accepts: the corpus only
+# updates on a rebuild, not automatically. When the source PDFs change and
+# `python -m kg_build --neo4j --embed` is re-run in the monorepo, all four
+# files here need a fresh copy (together — see README.md's Setup section)
+# and a
 # redeploy — it does not update itself. For how rarely a statute amends,
 # that's the right side of this trade-off; `docker-compose.yml`'s volume
 # mount is still how local dev picks up a rebuild instantly, without needing

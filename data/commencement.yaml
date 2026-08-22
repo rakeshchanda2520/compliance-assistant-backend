@@ -1,0 +1,47 @@
+# Staged commencement of the DPDP Rules, 2025.
+#
+# HUMAN-REVIEWED. Every date below is read from rule 1(2) of the Rules as
+# published, not inferred by a model and not computed by this system.
+#
+# Why this file exists: rule 1(2) states the schedule in prose ("...shall come
+# into force on the date of their publication... rule 4 shall come into force
+# on the expiry of one year..."). Without these dates as data, "is rule 4 in
+# force today?" is a reading-comprehension question put to a language model —
+# exactly the kind of question that produced this project's recorded errors.
+# With them, it is a date comparison.
+#
+# The Act, 2023 is treated as fully in force: sections were notified
+# separately and the corpus does not model that staging. Recorded here rather
+# than left implicit, because "no entry means in force" is a decision, not an
+# absence.
+#
+# published_on is the Gazette date the staged periods are measured from.
+# Verify against the Gazette before relying on any answer derived from this.
+
+published_on: 2025-11-14
+
+# Everything not listed is treated as in force from `published_on`.
+defaults:
+  act: 2023-08-11        # DPDP Act, 2023 — assent date
+  rules: 2025-11-14      # publication
+
+rules:
+  # In force on publication.
+  immediate:
+    reason: "rule 1(2): in force on the date of publication"
+    from: 2025-11-14
+    units: [r-1, r-2, r-17, r-18, r-19, r-20, r-21]
+
+  # One year after publication.
+  after_one_year:
+    reason: "rule 1(2): on the expiry of one year from publication"
+    from: 2026-11-14
+    units: [r-4]
+
+  # Eighteen months after publication.
+  after_eighteen_months:
+    reason: "rule 1(2): on the expiry of eighteen months from publication"
+    from: 2027-05-14
+    units:
+      [r-3, r-5, r-6, r-7, r-8, r-9, r-10, r-11, r-12, r-13, r-14, r-15,
+       r-16, r-22, r-23]
