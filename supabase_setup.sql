@@ -77,16 +77,52 @@ alter table public.login_events enable row level security;
 -- SQL in the Supabase dashboard, same as profiles. A future endpoint reading
 -- it is a deliberate addition, not implied by the table existing.
 
--- `security definer` is required here: this function reads/writes auth.users
--- and public tables, which the invoking role (the trigger firing on
--- auth.users) does not itself have privileges over. `set search_path = public`
--- pins name resolution so the function cannot be tricked by a schema placed
--- earlier on some other search path.
+-- ============================================================================
+-- The trigger.
+--
+-- READ THIS BEFORE EDITING. This function runs INSIDE the transaction that
+-- creates a user. If it raises, Postgres rolls that transaction back and
+-- Supabase Auth returns:
+--
+--     ?error=server_error&error_code=unexpected_failure
+--     &error_description=Database+error+saving+new+user
+--
+-- and the person cannot sign up AT ALL. Bookkeeping tables must never be
+-- able to lock users out of the product. Two defences below, and both are
+-- load-bearing:
+--
+--   1. NEVER pass an explicit NULL into a NOT NULL column. `login_at` has
+--      `default now()`, but a default only applies when the column is
+--      OMITTED — passing NULL explicitly is a constraint violation, not a
+--      fallback. This bit exactly once, and expensively: on INSERT into
+--      auth.users, `new.last_sign_in_at` is NULL (GoTrue sets it in a later
+--      step), so every attempt at a NEW account failed here while existing
+--      users, whose UPDATE carries a real timestamp, kept signing in
+--      normally. That asymmetry is what made it look like an account
+--      problem rather than a schema one.
+--
+--   2. The whole body is wrapped in an exception handler. Even a failure
+--      nobody predicted degrades to "this sign-in was not recorded" —
+--      logged as a warning, visible in the Postgres logs — rather than
+--      "this person cannot use the product". Analytics is not worth an
+--      authentication outage.
+--
+-- `security definer` is required: this function writes public tables that
+-- the invoking role (the trigger firing on auth.users) has no privileges
+-- over. `set search_path = public` pins name resolution so the function
+-- cannot be tricked by a schema placed earlier on some other search path.
+-- ============================================================================
+
 create or replace function public.handle_auth_user_change()
 returns trigger
 language plpgsql
 security definer set search_path = public
 as $$
+declare
+  -- Resolved ONCE, here, so neither insert below can pass a NULL into a
+  -- NOT NULL column. now() is the honest value: this trigger fires as part
+  -- of the sign-in, so "now" IS when the sign-in happened.
+  signed_in_at timestamptz := coalesce(new.last_sign_in_at, now());
 begin
   insert into public.profiles (id, email, full_name, avatar_url, last_sign_in_at)
   values (
@@ -94,23 +130,42 @@ begin
     new.email,
     new.raw_user_meta_data ->> 'full_name',
     new.raw_user_meta_data ->> 'avatar_url',
-    new.last_sign_in_at
+    signed_in_at
   )
   on conflict (id) do update
     set email           = excluded.email,
         full_name       = excluded.full_name,
         avatar_url      = excluded.avatar_url,
-        last_sign_in_at = excluded.last_sign_in_at;
+        -- greatest(), not a blind overwrite: the INSERT and the UPDATE of
+        -- last_sign_in_at are two separate statements on auth.users, so this
+        -- function fires twice per sign-up. Assigning excluded directly let
+        -- the second fire move the timestamp backwards if the two disagreed.
+        last_sign_in_at = greatest(public.profiles.last_sign_in_at,
+                                   excluded.last_sign_in_at);
 
-  -- Every fire of this function IS a login — the first-ever sign-up counts
-  -- as the first login too — so log it unconditionally. This is the one
-  -- addition beyond the profiles upsert above; no new trigger, no backend
-  -- code, no involvement from this app's server at all. Supabase Auth
-  -- updates auth.users on every Google sign-in on its own, whether or not
-  -- the backend happens to be running at that moment.
-  insert into public.login_events (user_id, email, full_name, login_at)
-  values (new.id, new.email, new.raw_user_meta_data ->> 'full_name', new.last_sign_in_at);
+  -- Exactly one row per actual sign-in, which is NOT the same as one row per
+  -- fire of this function. A sign-up fires it twice — once for the INSERT
+  -- into auth.users, again for the UPDATE where GoTrue stamps
+  -- last_sign_in_at — so logging unconditionally recorded every new user's
+  -- first login twice, in the one table whose entire purpose is answering
+  -- "how many times has this person signed in".
+  --
+  -- `last_sign_in_at is not null` is the discriminator, and it is exact
+  -- rather than a heuristic: that column is null precisely on the INSERT
+  -- half of a sign-up and populated on every fire that represents a real
+  -- sign-in. No de-duplication window, no unique index to tune.
+  if new.last_sign_in_at is not null then
+    insert into public.login_events (user_id, email, full_name, login_at)
+    values (new.id, new.email,
+            new.raw_user_meta_data ->> 'full_name', signed_in_at);
+  end if;
 
+  return new;
+
+exception when others then
+  -- See defence 2 above. Never re-raise: that would abort the sign-in.
+  raise warning 'handle_auth_user_change failed for user %: % (%)',
+    new.id, sqlerrm, sqlstate;
   return new;
 end;
 $$;
@@ -130,8 +185,53 @@ create trigger on_auth_user_login
 
 
 -- ============================================================================
+-- Backfill. Safe to run repeatedly.
+--
+-- Re-running this file replaces the function, but it does not go back and
+-- create rows for people the broken version skipped — anyone who signed in
+-- while it was live, plus anyone whose account predates the trigger being
+-- installed at all. This fills those in from auth.users, which Supabase
+-- maintains itself and which was never affected.
+--
+-- Only profiles is backfilled. login_events is a record of observed
+-- sign-ins; inventing history for logins nobody watched happen would make
+-- the one table meant to answer "when did this person sign in" lie.
+-- ============================================================================
+
+insert into public.profiles (id, email, full_name, avatar_url, last_sign_in_at)
+select u.id,
+       u.email,
+       u.raw_user_meta_data ->> 'full_name',
+       u.raw_user_meta_data ->> 'avatar_url',
+       u.last_sign_in_at
+from auth.users u
+on conflict (id) do update
+  set email      = excluded.email,
+      full_name  = coalesce(excluded.full_name, public.profiles.full_name),
+      avatar_url = coalesce(excluded.avatar_url, public.profiles.avatar_url),
+      last_sign_in_at = greatest(public.profiles.last_sign_in_at,
+                                 excluded.last_sign_in_at);
+
+
+-- ============================================================================
 -- Sanity checks and useful queries
 -- ============================================================================
+
+-- 1. Is the fix actually live? Should print one row containing
+--    "coalesce(new.last_sign_in_at, now())". If it does not, the old
+--    function is still installed and new sign-ups will keep failing:
+--   select prosrc from pg_proc where proname = 'handle_auth_user_change';
+
+-- 2. Is anyone missing a profile? Should be 0 after the backfill above:
+--   select count(*) from auth.users u
+--    left join public.profiles p on p.id = u.id
+--    where p.id is null;
+
+-- 3. If a sign-up still fails, the real Postgres error is in
+--    Dashboard -> Logs -> Postgres Logs, as a WARNING beginning
+--    "handle_auth_user_change failed for user". The exception handler means
+--    it can no longer block the sign-up, so this is now a diagnostic to
+--    read at leisure rather than an outage to fix under pressure.
 
 -- Should show your own account after you sign in again:
 --   select email, full_name, created_at, last_sign_in_at
