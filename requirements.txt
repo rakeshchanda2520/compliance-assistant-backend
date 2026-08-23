@@ -17,10 +17,29 @@ PyJWT>=2.8
 # form Atlas gives you — importing without it fails at connection time, not
 # at pip install time, so it is easy to miss.
 pymongo[srv]>=4.9
+# The dense half of hybrid retrieval. 237 x 1024 floats is a numpy array, not
+# a vector database — one dot product per query over a sub-megabyte matrix.
+# A hard requirement, not optional: backend/dense.py imports it at module
+# level and app.py imports dense unconditionally (it returns None when
+# DPDP_HYBRID=0, but the import still happens).
+numpy>=1.26
 
 # Build only — kg_build. Not imported by the serving path.
 pdfplumber>=0.11
 networkx>=3.3
+
+# Optional: only when DPDP_EMBED_PROVIDER=local.
+#
+# fastembed, NOT sentence-transformers. Measured: `import torch` alone costs
+# +168MB RSS before a single weight loads, against a 512MB free tier that
+# already holds Neo4j's driver, pymongo, the graph and the chunk index.
+# fastembed runs the same bge-small-en-v1.5 weights on ONNX Runtime at
+# roughly 40-60MB.
+#
+# The hosted default (DPDP_EMBED_PROVIDER=openrouter) needs none of this —
+# but note it costs a request per query against a free tier that caps them
+# daily. See V2_PLAN.md 2.4 for the measured trade-off.
+# fastembed>=0.4
 
 # Optional: only when DPDP_PROVIDER=claude.
 # anthropic>=0.40

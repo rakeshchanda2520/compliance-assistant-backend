@@ -52,6 +52,37 @@ class Chunk:
             self.plain_english, " ".join(self.questions),
         ]))
 
+    def embedding_text(self, max_chars: int) -> str:
+        """What the DENSE retriever sees. Not the same as `document`.
+
+        Embedding models have a hard input limit — the hosted one here caps at
+        512 tokens, and the longest chunk in this corpus is roughly 1350. So
+        something has to be dropped, and the order matters.
+
+        The semantic layer goes first: label, headnote, chapter and the
+        plain-language gloss are what a paraphrased question actually matches
+        against. Verbatim statute fills whatever budget remains.
+
+        That BM25 and dense score different text is not a compromise — it is
+        the reason hybrid retrieval works. BM25 reads the full verbatim text
+        and is what keeps "250 crore" from blurring into "200 crore"; dense
+        reads the summary and catches the phrasing BM25 misses. RRF fuses
+        RANKS, so the two never have to be on a comparable scale.
+
+        Truncation is on a word boundary, so a cut never leaves a half-token
+        the model has to guess at.
+        """
+        semantic = " ".join(filter(None, [
+            self.label, self.headnote, self.chapter,
+            self.plain_english, " ".join(self.questions),
+        ])).strip()
+
+        if len(semantic) >= max_chars:
+            return _cut(semantic, max_chars)
+
+        remaining = max_chars - len(semantic) - 1
+        return f"{semantic} {_cut(self.verbatim.strip(), remaining)}".strip()
+
     def to_dict(self) -> dict:
         return {
             "id": self.id, "node_id": self.node_id, "kind": self.kind,
@@ -71,6 +102,17 @@ class Chunk:
             plain_english=raw.get("plain_english", ""),
             questions=list(raw.get("questions", [])),
         )
+
+
+def _cut(text: str, limit: int) -> str:
+    """Truncate on a word boundary, never mid-word."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit]
+    space = clipped.rfind(" ")
+    return clipped[:space] if space > limit // 2 else clipped
 
 
 def stem(token: str) -> str | None:

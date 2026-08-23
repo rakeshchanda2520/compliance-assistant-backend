@@ -45,6 +45,11 @@ TIMEOUT_MS = 5000     # analytics must never hold a request open
 _client = MongoClient(config.MONGODB_URI, serverSelectionTimeoutMS=TIMEOUT_MS,
                       connectTimeoutMS=TIMEOUT_MS)
 _collection = _client[config.MONGODB_DB]["interactions"]
+# Conversation turns (V2 phase 5). A separate collection rather than a field
+# on `interactions`: a turn is written on every outcome including abstains,
+# and `interactions` is the record of ANSWERS. Conflating them would make
+# `/api/history` show abstained turns as reopenable answers.
+_conversations = _client[config.MONGODB_DB]["conversations"]
 
 try:
     # Idempotent — safe to run on every startup, not just the first one. But
@@ -57,6 +62,8 @@ try:
     _collection.create_index([("user_id", 1), ("created_at", -1)])
     _collection.create_index([("session_id", 1), ("created_at", -1)])
     _collection.create_index([("created_at", -1)])
+    _conversations.create_index([("conversation_id", 1), ("created_at", 1)])
+    _conversations.create_index([("user_id", 1), ("created_at", -1)])
 except PyMongoError as exc:
     # The app still starts and still answers questions — it just runs
     # without these indexes until the next restart finds Mongo reachable.
@@ -99,6 +106,62 @@ def list_for_user(user_id: str, limit: int, before: str | None) -> list[dict]:
             .sort("created_at", -1)
             .limit(limit))
     return [_public(d) for d in docs]
+
+
+def record_turn(conversation_id: str, user_id: str, question: str,
+                provision_ids: list[str], intent: str) -> None:
+    """One conversation turn. Never raises, same contract as `record()`.
+
+    WHAT IS STORED IS THE POINT. The question, the provisions it reached, and
+    the intent — and deliberately NOT the model's answer.
+
+    Carrying a prior answer forward is how a system defends a hallucination
+    three turns later: the model reads its own earlier mistake as established
+    context and elaborates on it. Questions and provision ids give continuity
+    of SUBJECT without continuity of ERROR. A follow-up re-derives its answer
+    from the statute every time.
+    """
+    if not conversation_id:
+        return
+    try:
+        _conversations.insert_one({
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "question": question,
+            "provision_ids": list(provision_ids),
+            "intent": intent,
+            "created_at": datetime.now(timezone.utc),
+        })
+    except Exception as exc:                          # noqa: BLE001
+        log.warning("conversation turn not recorded: %s", type(exc).__name__)
+
+
+def recent_turns(conversation_id: str, user_id: str,
+                 limit: int = 3) -> list[dict]:
+    """The last few turns of one conversation, oldest first. Never raises.
+
+    Scoped to `user_id` as well as `conversation_id`: a conversation id is a
+    client-supplied opaque string, so without this scope a caller could read
+    another user's turns by guessing one. The id alone is not a credential.
+
+    Returns [] on failure rather than raising — losing conversational context
+    degrades a follow-up into a standalone question, which is the V1
+    behaviour and perfectly serviceable. Failing the request would not be.
+    """
+    if not conversation_id:
+        return []
+    try:
+        docs = (_conversations
+                .find({"conversation_id": conversation_id, "user_id": user_id})
+                .sort("created_at", -1)
+                .limit(limit))
+        return [{"question": d.get("question", ""),
+                 "provision_ids": list(d.get("provision_ids") or []),
+                 "intent": d.get("intent", "")}
+                for d in reversed(list(docs))]
+    except Exception as exc:                          # noqa: BLE001
+        log.warning("conversation turns unavailable: %s", type(exc).__name__)
+        return []
 
 
 def _public(doc: dict) -> dict:

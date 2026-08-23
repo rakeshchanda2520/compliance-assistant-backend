@@ -16,14 +16,18 @@ is an edge, not a similarity.
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rank_bm25 import BM25Okapi
 
+from . import config, embeddings
 from .graph_store import Graph
 from .indexing import Chunk, tokenize
+
+log = logging.getLogger(__name__)
 
 # A cited provision is more load-bearing than a merely mentioned term, and
 # MENTIONS is exhaustive by construction — unranked, it buries the cited
@@ -57,10 +61,22 @@ class Result:
 
 @dataclass
 class Trace:
-    """What retrieval did, so an answer can be audited without re-running it."""
+    """What retrieval did, so an answer can be audited without re-running it.
+
+    V2 adds the per-retriever ranks. That is not decoration: the V1 argument
+    for vocab.yaml over embeddings was auditability, and the honest answer to
+    "dense retrieval is a black box" is to surface its scores rather than to
+    avoid using it. A wrong dense hit is now as inspectable as a wrong vocab
+    expansion.
+    """
     expanded_query: str
     vocab_hits: list[str]
     intents: list[str]
+    bm25_ranks: dict[str, int] = field(default_factory=dict)
+    dense_ranks: dict[str, int] = field(default_factory=dict)
+    dense_scores: dict[str, float] = field(default_factory=dict)
+    fused: bool = False
+    dense_error: str = ""
 
 
 class Retriever:
@@ -68,12 +84,15 @@ class Retriever:
     the corpus does not change between builds, and rebuilding it on every
     question was measurable latency for no gain."""
 
-    def __init__(self, chunks: list[Chunk], graph: Graph, vocab: dict) -> None:
+    def __init__(self, chunks: list[Chunk], graph: Graph, vocab: dict,
+                 dense_index=None) -> None:
         self.chunks = chunks
         self.graph = graph
         self.vocab = vocab
+        self.dense_index = dense_index
         self._bm25 = BM25Okapi([tokenize(c.document) for c in chunks])
         self._by_node = {c.node_id: c for c in chunks}
+        self._by_chunk_id = {c.id: c for c in chunks}
         self._adjacency = self._build_adjacency()
 
     # -- query rewriting --------------------------------------------------- #
@@ -130,14 +149,26 @@ class Retriever:
 
     # -- retrieval ---------------------------------------------------------- #
 
-    def retrieve(self, query: str, k: int = 6) -> tuple[list[Result], Trace]:
+    def retrieve(self, query: str, k: int = 6,
+                 seed_ids: list[str] | None = None) -> tuple[list[Result], Trace]:
+        """Seed with BM25 (fused with dense when enabled), then walk the graph.
+
+        `seed_ids` injects provisions from a prior conversation turn as
+        additional hop-0 seeds (phase 5). They join the seed set rather than
+        replacing it, so a follow-up can still reach something the earlier
+        turn never mentioned.
+        """
         expanded, hits, intents = self.expand_query(query)
-        scores = self._bm25.get_scores(tokenize(expanded))
+        # V2: vocab is a post-hoc BOOST, not a pre-BM25 expansion, so the
+        # ON/OFF ablation is interpretable. Expansion changes what BM25
+        # scores, which confounds any measurement of what vocab contributes.
+        bm25_query = query if config.HYBRID else expanded
+        scores = self._bm25.get_scores(tokenize(bm25_query))
 
         boost_kinds: set[str] = set()
         boost_chapters: set[str] = set()
         for name in intents:
-            cfg = self.vocab["intents"][name]
+            cfg = (self.vocab.get("intents") or {}).get(name) or {}
             boost_kinds.update(cfg.get("boost_kinds", []))
             if chapter := cfg.get("boost_chapter"):
                 boost_chapters.add(chapter)
@@ -146,11 +177,16 @@ class Retriever:
                 if chunk.kind in boost_kinds or chunk.chapter in boost_chapters:
                     scores[i] *= INTENT_BOOST
 
-        ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
-        seeds = [
-            Result(self.chunks[i], round(float(scores[i]), 4), hop=0)
-            for i in ranked[:k] if scores[i] > 0
-        ]
+        trace = Trace(expanded, hits, intents)
+        seeds = self._seed(query, expanded, scores, hits, k, trace)
+
+        if seed_ids:
+            chosen = {s.id for s in seeds}
+            for node_id in seed_ids:
+                chunk = self._chunk_for(node_id)
+                if chunk is not None and chunk.id not in chosen:
+                    seeds.append(Result(chunk, 0.0, hop=0, via="prior turn"))
+                    chosen.add(chunk.id)
 
         # The Schedule is seven rows. For a penalty question, ranking them
         # against each other is the wrong problem — and it actively fails:
@@ -164,7 +200,73 @@ class Retriever:
                 if chunk.kind == "Penalty" and chunk.id not in chosen:
                     seeds.append(Result(chunk, round(float(scores[i]), 4), hop=0))
 
-        return self._expand(seeds), Trace(expanded, hits, intents)
+        return self._expand(seeds), trace
+
+    # -- seeding ------------------------------------------------------------ #
+
+    def _seed(self, query: str, expanded: str, bm25_scores, vocab_hits: list[str],
+              k: int, trace: Trace) -> list[Result]:
+        """Top-k hop-0 chunks: BM25 alone, or BM25 fused with dense via RRF."""
+        order = sorted(range(len(bm25_scores)), key=lambda i: -bm25_scores[i])
+        trace.bm25_ranks = {self.chunks[i].node_id: rank
+                            for rank, i in enumerate(order[:20])}
+
+        if not (config.HYBRID and self.dense_index):
+            return [Result(self.chunks[i], round(float(bm25_scores[i]), 4), hop=0)
+                    for i in order[:k] if bm25_scores[i] > 0]
+
+        try:
+            vector = embeddings.embed_one(query, is_query=True)
+            dense_hits = self.dense_index.search(vector, 20)
+        except Exception as exc:                       # noqa: BLE001
+            # Dense is additive. If the provider is down or rate-limited, BM25
+            # alone is a degraded but CORRECT answer — far better than failing
+            # a question outright. The trace records that it happened so a
+            # quality drop is explainable rather than mysterious.
+            log.warning("dense retrieval unavailable, using BM25 only: %s", exc)
+            trace.dense_error = f"{type(exc).__name__}: {exc}"
+            return [Result(self.chunks[i], round(float(bm25_scores[i]), 4), hop=0)
+                    for i in order[:k] if bm25_scores[i] > 0]
+
+        trace.fused = True
+        trace.dense_ranks = {nid: rank for rank, (nid, _) in enumerate(dense_hits)}
+        trace.dense_scores = {nid: round(score, 4) for nid, score in dense_hits}
+
+        # Reciprocal Rank Fusion. Rank-based on purpose: BM25 scores are
+        # unbounded and cosine sits in [-1,1], so any score-level combination
+        # needs a normalisation that would itself need calibrating per corpus.
+        # Ranks need none.
+        fused: dict[str, float] = {}
+        for rank, i in enumerate(order):
+            if bm25_scores[i] > 0:
+                fused[self.chunks[i].node_id] = 1.0 / (config.RRF_K + rank)
+        for rank, (node_id, _) in enumerate(dense_hits):
+            fused[node_id] = fused.get(node_id, 0.0) + 1.0 / (config.RRF_K + rank)
+
+        # vocab.yaml, demoted to a boost. It survives dense retrieval for the
+        # cases dense genuinely cannot do: abbreviations ("SDF"), statute-coined
+        # jargon that embeds near a generic near-synonym, and Rules vocabulary
+        # where there is no plain-language layer to help.
+        if vocab_hits:
+            boosted = self._vocab_targets(vocab_hits)
+            for node_id in boosted:
+                if node_id in fused:
+                    fused[node_id] *= config.VOCAB_BOOST
+
+        ranked = sorted(fused.items(), key=lambda kv: -kv[1])[:k]
+        return [Result(self._by_node[nid], round(score, 6), hop=0)
+                for nid, score in ranked if nid in self._by_node]
+
+    def _vocab_targets(self, phrases: list[str]) -> set[str]:
+        """Chunks whose text carries a statutory term one of the matched
+        vocab phrases maps to. Computed per query rather than cached: the
+        matched-phrase set is small and this keeps vocab.yaml hot-editable."""
+        terms = self.vocab.get("terms", {})
+        wanted = {t.lower() for phrase in phrases for t in terms.get(phrase, [])}
+        if not wanted:
+            return set()
+        return {c.node_id for c in self.chunks
+                if any(term in c.document.lower() for term in wanted)}
 
     def _expand(self, seeds: list[Result]) -> list[Result]:
         picked: dict[str, Result] = {s.id: s for s in seeds}

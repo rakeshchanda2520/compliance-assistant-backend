@@ -49,6 +49,19 @@ class Provider(ABC):
     def stream(self, prompt: str, system: str,
                temperature: float) -> Iterator[str]: ...
 
+    def stream_structured(self, prompt: str, system: str, temperature: float,
+                          schema: dict) -> Iterator[str]:
+        """Stream while constrained to `schema`.
+
+        The default is an honest no-op: stream normally and let the prompt do
+        the work. A provider that cannot truly constrain decoding should NOT
+        pretend to — `streaming.AnswerStream` already handles a model that
+        ignores the schema, so an unconstrained provider degrades to the
+        free-text path instead of failing. Overriding this is an optimisation,
+        not a correctness requirement.
+        """
+        yield from self.stream(prompt, system, temperature)
+
 
 class OllamaProvider(Provider):
     def _post(self, path: str, payload: dict, *, stream: bool):
@@ -60,14 +73,22 @@ class OllamaProvider(Provider):
         return urllib.request.urlopen(request, timeout=config.LLM_TIMEOUT)
 
     def _payload(self, prompt: str, system: str, temperature: float,
-                 stream: bool) -> dict:
-        return {
+                 stream: bool, schema: dict | None = None) -> dict:
+        payload = {
             "model": config.MODEL,
             "messages": ([{"role": "system", "content": system}] if system else [])
                         + [{"role": "user", "content": prompt}],
             "stream": stream,
             "options": {"num_ctx": config.NUM_CTX, "temperature": temperature},
         }
+        if schema:
+            # Ollama takes the JSON schema directly in `format` (a bare
+            # "json" string also works on older builds). This is real
+            # constrained decoding via llama.cpp's grammar support, which
+            # matters here: the local model is the 3B one, and it is the
+            # least likely of the three to follow a schema from prose alone.
+            payload["format"] = schema
+        return payload
 
     def check(self) -> str | None:
         try:
@@ -90,10 +111,18 @@ class OllamaProvider(Provider):
             log.exception("ollama completion failed")
             raise LLMError("the language model did not return an answer") from exc
 
+    def stream_structured(self, prompt: str, system: str, temperature: float,
+                          schema: dict) -> Iterator[str]:
+        yield from self._stream(prompt, system, temperature, schema)
+
     def stream(self, prompt: str, system: str, temperature: float) -> Iterator[str]:
+        yield from self._stream(prompt, system, temperature)
+
+    def _stream(self, prompt: str, system: str, temperature: float,
+                schema: dict | None = None) -> Iterator[str]:
         try:
             with self._post("/api/chat",
-                            self._payload(prompt, system, temperature, True),
+                            self._payload(prompt, system, temperature, True, schema),
                             stream=True) as response:
                 for raw in response:
                     if not raw.strip():
@@ -173,14 +202,25 @@ class OpenRouterProvider(Provider):
         }
 
     def _payload(self, prompt: str, system: str, temperature: float,
-                 stream: bool) -> dict:
-        return {
-            "model": config.MODEL,
+                 stream: bool, schema: dict | None = None,
+                 model: str | None = None) -> dict:
+        payload = {
+            "model": model or config.MODEL,
             "messages": ([{"role": "system", "content": system}] if system else [])
                         + [{"role": "user", "content": prompt}],
             "temperature": temperature,
             "stream": stream,
         }
+        if schema:
+            # OpenRouter passes json_schema through to vendors that support
+            # constrained decoding and degrades gracefully on those that
+            # don't — which is exactly the contract AnswerStream expects.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "compliance_answer",
+                                "strict": True, "schema": schema},
+            }
+        return payload
 
     def check(self) -> str | None:
         if not config.OPENROUTER_API_KEY:
@@ -204,10 +244,20 @@ class OpenRouterProvider(Provider):
             log.exception("openrouter completion failed")
             raise LLMError("the language model did not return an answer") from exc
 
+    def stream_structured(self, prompt: str, system: str, temperature: float,
+                          schema: dict) -> Iterator[str]:
+        yield from self._stream(prompt, system, temperature, schema=schema)
+
     def stream(self, prompt: str, system: str, temperature: float) -> Iterator[str]:
+        yield from self._stream(prompt, system, temperature)
+
+    def _stream(self, prompt: str, system: str, temperature: float,
+                schema: dict | None = None,
+                model: str | None = None) -> Iterator[str]:
         request = urllib.request.Request(
             config.OPENROUTER_HOST + "/chat/completions",
-            data=json.dumps(self._payload(prompt, system, temperature, True)).encode("utf-8"),
+            data=json.dumps(self._payload(prompt, system, temperature, True,
+                                          schema, model)).encode("utf-8"),
             headers=self._headers())
         try:
             with urllib.request.urlopen(request, timeout=config.LLM_TIMEOUT) as response:
@@ -261,6 +311,95 @@ def stream(prompt: str, system: str = "", temperature: float = 0.1) -> Iterator[
     yield from provider().stream(prompt, system, temperature)
 
 
+def stream_structured(prompt: str, system: str, schema: dict,
+                      temperature: float = 0.1,
+                      large: bool = False) -> Iterator[str]:
+    """Stream constrained to `schema`, optionally on the larger model."""
+    engine = large_provider() if large else provider()
+    yield from engine.stream_structured(prompt, system, temperature, schema)
+
+
 def is_small_model() -> bool:
     return config.PROVIDER == "ollama" and any(
         tag in config.MODEL.lower() for tag in SMALL_TAGS)
+
+
+# --------------------------------------------------------------------------- #
+# complexity routing
+# --------------------------------------------------------------------------- #
+
+_large_instance: Provider | None = None
+
+
+class _LargeOpenRouter(OpenRouterProvider):
+    """The large model, reached through the same OpenRouter transport.
+
+    A subclass rather than a config flip because both models must be usable
+    in the same process: a simple question and a compound one can be in
+    flight simultaneously, and mutating config.MODEL between them would make
+    the model that answered a given request unknowable.
+    """
+
+    def _payload(self, prompt, system, temperature, stream, schema=None, model=None):
+        return super()._payload(prompt, system, temperature, stream, schema,
+                                model or config.LARGE_MODEL)
+
+    def check(self) -> str | None:
+        if not config.OPENROUTER_API_KEY:
+            return "OPENROUTER_API_KEY is not set (needed for the large model)"
+        if not config.LARGE_MODEL:
+            return "DPDP_LARGE_MODEL is not set"
+        return None
+
+
+def large_provider() -> Provider:
+    """The model used for genuinely complex questions.
+
+    Falls back to the default provider when the large one is unconfigured —
+    a missing large model should degrade answer quality, never fail a request
+    that the default model can serve.
+    """
+    global _large_instance
+    if _large_instance is None:
+        if config.LARGE_PROVIDER == "openrouter":
+            _large_instance = _LargeOpenRouter()
+        elif config.LARGE_PROVIDER in _PROVIDERS:
+            _large_instance = _PROVIDERS[config.LARGE_PROVIDER]()
+        else:
+            log.warning("unknown DPDP_LARGE_PROVIDER %r; using the default "
+                        "provider for complex questions", config.LARGE_PROVIDER)
+            _large_instance = provider()
+        if problem := _large_instance.check():
+            log.warning("large model unavailable (%s); complex questions will "
+                        "use %s/%s", problem, config.PROVIDER, config.MODEL)
+            _large_instance = provider()
+    return _large_instance
+
+
+def needs_large_model(question: str, provision_count: int, intent: str) -> bool:
+    """Route by complexity, not by preference.
+
+    The 3B default produced BOTH errors on record, but making every question
+    pay for a large model is the wrong correction — templates need no model
+    at all, and a single-provision lookup does not need a frontier one. The
+    signals below are the ones that actually correlate with the failures:
+    reasoning across several provisions, and explicit comparison.
+    """
+    if config.FORCE_LARGE:
+        return True
+    if intent == "compound":
+        return True
+    if provision_count >= 3:
+        return True
+    low = question.lower()
+    return any(word in low for word in
+               ("compare", "difference", "versus", " vs ", "both", "whereas"))
+
+
+def model_name(large: bool) -> str:
+    """Which model actually answered — recorded per request, so a bad answer
+    can be attributed rather than guessed at."""
+    if not large:
+        return config.MODEL
+    return (config.LARGE_MODEL if isinstance(large_provider(), _LargeOpenRouter)
+            else config.MODEL)
