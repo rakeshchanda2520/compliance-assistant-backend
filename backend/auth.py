@@ -30,6 +30,13 @@ what selects the path.
 Failures are deliberately uninformative to the caller. "expired" versus
 "wrong issuer" versus "malformed" tells an attacker which part of a forged
 token to fix next; the real reason is logged, and the caller gets 401.
+
+One exception to that, and it matters: a token this service could not
+*check* is not the same as a token that failed the check. If Supabase's JWKS
+endpoint is briefly unreachable, the token in the browser is perfectly valid
+and the caller can do nothing about it — answering 401 there tells them to
+sign in again, which cannot help, and they will loop. That case returns 503
+instead, which says "us, not you", and which a client can retry.
 """
 from __future__ import annotations
 
@@ -56,16 +63,39 @@ _UNAUTHORIZED = HTTPException(
     headers={"WWW-Authenticate": "Bearer"},
 )
 
+# Not 401. See the module docstring: this is "we could not verify", not "your
+# token is bad", and the two need different advice and different client
+# behaviour.
+_KEYS_UNAVAILABLE = HTTPException(
+    status_code=503,
+    detail="could not reach the sign-in service to verify your session; "
+           "please retry in a moment",
+    headers={"Retry-After": "5"},
+)
+
+# Small clock skew between Supabase's signing host and this one is normal, and
+# without leeway it surfaces as a token that is "expired" a second before it
+# is, or "not yet valid" a second after it was issued — both of which read to
+# the user as a login that silently did not take.
+LEEWAY_SECONDS = 30
+
 # PyJWKClient caches fetched keys and refreshes on an unknown `kid`, so key
 # rotation is handled without a restart and without a fetch per request.
+# `timeout` is explicit: the default is 30s, and a stalled JWKS fetch holding
+# a request thread for half a minute is its own outage.
 _jwks_client: jwt.PyJWKClient | None = None
 
 
 def _jwks() -> jwt.PyJWKClient:
     global _jwks_client
     if _jwks_client is None:
-        _jwks_client = jwt.PyJWKClient(config.SUPABASE_JWKS_URL)
+        _jwks_client = jwt.PyJWKClient(
+            config.SUPABASE_JWKS_URL, cache_keys=True, lifespan=600, timeout=5)
     return _jwks_client
+
+
+class KeysUnavailable(Exception):
+    """The signing key could not be fetched. Says nothing about the token."""
 
 
 @dataclass(frozen=True)
@@ -99,7 +129,18 @@ def verify(token: str) -> Identity:
     algorithm = jwt.get_unverified_header(token).get("alg")
 
     if algorithm in ASYMMETRIC:
-        key = _jwks().get_signing_key_from_jwt(token).key
+        try:
+            key = _jwks().get_signing_key_from_jwt(token).key
+        except jwt.exceptions.PyJWKClientConnectionError as exc:
+            # Network/DNS/TLS failure reaching Supabase. Nothing to do with
+            # this token — see KeysUnavailable and the module docstring.
+            raise KeysUnavailable(str(exc)) from exc
+        except jwt.exceptions.PyJWKSetError as exc:
+            # A JWKS document that parsed but held no usable key. On Supabase
+            # this is the signature of a project still on legacy HS256 that is
+            # somehow issuing an asymmetric token — a misconfiguration here,
+            # not a forged token there.
+            raise KeysUnavailable(str(exc)) from exc
         algorithms = list(ASYMMETRIC)
     elif algorithm in SYMMETRIC:
         if not config.SUPABASE_JWT_SECRET:
@@ -118,15 +159,29 @@ def verify(token: str) -> Identity:
         algorithms=algorithms,
         audience=config.SUPABASE_AUDIENCE,
         issuer=config.SUPABASE_ISSUER,
+        leeway=LEEWAY_SECONDS,
         # Signature alone is not enough. Without `aud`/`iss` pinned, a valid
         # token minted by any *other* Supabase project would verify here.
         # PyJWT does not check either by default.
         options={"require": ["exp", "sub", "aud", "iss"]},
     )
 
+    # Supabase's anonymous sign-in issues a token with the same `authenticated`
+    # audience as a real one, distinguished only by this claim. Without the
+    # check, "answering requires a Google sign-in" would be satisfiable by a
+    # single unauthenticated API call — which is the entire gate, gone.
+    if claims.get("is_anonymous") is True:
+        raise jwt.InvalidTokenError("anonymous sessions may not ask questions")
+
     metadata = claims.get("user_metadata") or {}
     return Identity(
         sub=claims["sub"],
+        # `email` at the top level is the account's email as Supabase holds it;
+        # user_metadata's copy is whatever the OAuth provider last sent, which
+        # can lag. Top level wins — this is what distinguishes two accounts
+        # that share a display name, and the fallback order used to be able to
+        # attribute one person's answers to the other's row when their
+        # provider metadata had not refreshed.
         email=claims.get("email") or metadata.get("email") or "",
         name=metadata.get("full_name") or metadata.get("name") or "",
         session_id=claims.get("session_id") or "",
@@ -145,6 +200,13 @@ async def require_user(authorization: str = Header(default="")) -> Identity:
 
     try:
         return verify(token.strip())
+    except KeysUnavailable as exc:
+        # Our failure, not theirs. Logged loudly (this is an outage of a
+        # dependency, not routine traffic) and reported as 503 so the client
+        # retries instead of bouncing the user back through a sign-in that
+        # would have worked fine.
+        log.error("signing keys unavailable, cannot verify tokens: %s", exc)
+        raise _KEYS_UNAVAILABLE from exc
     except Exception as exc:                     # noqa: BLE001
         # Logged at warning, not exception: an expired or malformed token is
         # normal traffic (a stale browser tab), not a server fault. The type

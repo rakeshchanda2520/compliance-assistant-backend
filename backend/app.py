@@ -457,8 +457,16 @@ async def _stream_template(rendered, graph, results, plan, commencement,
     for piece in rendered.chunks():
         yield _sse("token", {"t": piece})
 
-    checked = citations.check_template(rendered.citations, graph)
-    penalties = citations.penalty_facts(results, graph)
+    with observability.step("verify_citations", as_type="evaluator",
+                            input=rendered.text) as verify_span:
+        checked = citations.check_template(rendered.citations, graph)
+        penalties = citations.penalty_facts(results, graph)
+        if verify_span:
+            verify_span.update(
+                output=[{"id": c.id, "status": c.status} for c in checked],
+                metadata={"method": "template",
+                          "note": "verified by construction — every id is a "
+                                  "node the renderer read from the graph"})
     citations_payload = {"citations": [c.to_dict() for c in checked],
                          "penalties": penalties}
     yield _sse("citations", citations_payload)
@@ -496,8 +504,11 @@ async def _stream_template(rendered, graph, results, plan, commencement,
     yield _sse("done", done_payload)
 
     if root:
-        root.update(output=rendered.text,
-                    metadata={"path": "template", "intent": plan.intent})
+        root.update(output=rendered.text, metadata={
+            "path": "template", "intent": plan.intent, "model": None,
+            "citation_statuses": [c.status for c in checked],
+            "citations": [c.id for c in checked],
+            "elapsed_ms": elapsed_ms()})
     observability.flush()
 
     finish("answered", answer=rendered.text, intent=plan.intent,
@@ -609,16 +620,38 @@ async def chat(q: Question, request: Request,
                     [p["id"] for p in (retrieval_payload or {}).get("provisions", [])],
                     extra.get("intent", ""))
 
-        # One Langfuse trace per request, with a child observation per stage
-        # — the same three stages as the SSE events above and the fields
-        # audit.py writes, so a trace in the Langfuse UI, the network tab,
-        # and a line in the local audit log describe one request the same
-        # way. A no-op everywhere tracing isn't configured (observability.py)
-        # — this function's control flow is identical whether it's on or off.
+        # One Langfuse trace per request, with a child observation for EVERY
+        # stage that does work — see observability.py for why that is every
+        # stage and not only the ones that emit an SSE event. A no-op
+        # everywhere tracing isn't configured; this function's control flow is
+        # identical whether it's on or off.
+        #
+        # session_id is the CONVERSATION thread, not the sign-in session: it
+        # is what makes Langfuse's Sessions view show the turns of one
+        # conversation together, which is the grouping anyone reading traces
+        # actually wants. The sign-in session is coarser (one sign-in spans
+        # many conversations) and rides in trace metadata and a tag instead.
+        # `thread` falls back to the sign-in session so a client that sends no
+        # conversation_id still groups into something rather than nothing.
+        thread = q.conversation_id or user.session_id or request_id
         with observability.trace(
                 "compliance.answer", input=q.question,
-                user_id=user.sub, session_id=user.session_id,
-                metadata={"request_id": request_id, "k": q.k}) as root:
+                user_id=user.sub, session_id=thread,
+                tags=[f"provider:{config.PROVIDER}",
+                      f"build:{graph.build_id}",
+                      f"hybrid:{int(config.HYBRID)}",
+                      f"router:{int(config.INTENT_ROUTER)}"],
+                trace_metadata={
+                    "request_id": request_id,
+                    "conversation_id": q.conversation_id or "",
+                    "auth_session_id": user.session_id,
+                    "user_email": user.email,
+                    "user_name": user.name,
+                    "build_id": graph.build_id,
+                    "as_of": as_of.isoformat(),
+                },
+                metadata={"request_id": request_id, "k": q.k,
+                          "as_of": as_of.isoformat()}) as root:
 
             # 0. Understand the question before retrieving anything.
             #    The query vector is computed ONCE here and reused for both
@@ -627,14 +660,39 @@ async def chat(q: Question, request: Request,
             #    single most expensive mistake available in this file.
             query_vector = None
             if config.INTENT_ROUTER or config.HYBRID:
-                try:
-                    query_vector = await asyncio.to_thread(
-                        embeddings.embed_one, q.question, is_query=True)
-                except Exception as exc:               # noqa: BLE001
-                    log.warning("query embedding unavailable: %s", exc)
+                with observability.step(
+                        "embed_query", as_type="embedding",
+                        model=config.EMBED_MODEL,
+                        input=q.question) as embed_span:
+                    try:
+                        query_vector = await asyncio.to_thread(
+                            embeddings.embed_one, q.question, is_query=True)
+                        if embed_span:
+                            embed_span.update(
+                                output={"dimensions": len(query_vector)},
+                                metadata={"provider": config.EMBED_PROVIDER})
+                    except Exception as exc:           # noqa: BLE001
+                        # Degradation, not failure: retrieval falls back to
+                        # BM25 and the router to its regex tier. Recorded on
+                        # the span at WARNING so a quota exhaustion shows up
+                        # as a visible amber stage rather than as unexplained
+                        # quality loss weeks later.
+                        log.warning("query embedding unavailable: %s", exc)
+                        if embed_span:
+                            embed_span.update(level="WARNING",
+                                              status_message=str(exc))
 
-            plan = await asyncio.to_thread(
-                understanding.understand, q.question, classifier, query_vector)
+            with observability.step("route", as_type="chain",
+                                    input=q.question) as route_span:
+                plan = await asyncio.to_thread(
+                    understanding.understand, q.question, classifier,
+                    query_vector)
+                if route_span:
+                    route_span.update(
+                        output={"intent": plan.intent,
+                                "template": plan.uses_template,
+                                "abstain": plan.should_abstain},
+                        metadata=plan.to_dict())
 
             router_payload = {
                 "path": "template" if plan.uses_template else "llm",
@@ -668,13 +726,24 @@ async def chat(q: Question, request: Request,
             # 0b. Prior turns contribute provisions, never prose.
             prior_ids: list[str] = []
             if config.CONVERSATIONS and q.conversation_id:
-                turns = await asyncio.to_thread(
-                    mongo.recent_turns, q.conversation_id, user.sub, 3)
-                # Only when the question cannot stand alone. A self-contained
-                # follow-up should retrieve on its own merits, or turn 3 keeps
-                # dragging turn 1's provisions into an unrelated answer.
-                if plan.has_anaphora:
-                    prior_ids = [pid for t in turns for pid in t["provision_ids"]][:6]
+                with observability.step(
+                        "conversation_context", as_type="span",
+                        input={"conversation_id": q.conversation_id,
+                               "has_anaphora": plan.has_anaphora}) as conv_span:
+                    turns = await asyncio.to_thread(
+                        mongo.recent_turns, q.conversation_id, user.sub, 3)
+                    # Only when the question cannot stand alone. A
+                    # self-contained follow-up should retrieve on its own
+                    # merits, or turn 3 keeps dragging turn 1's provisions
+                    # into an unrelated answer.
+                    if plan.has_anaphora:
+                        prior_ids = [pid for t in turns
+                                     for pid in t["provision_ids"]][:6]
+                    if conv_span:
+                        conv_span.update(
+                            output={"turns": len(turns), "seeds": prior_ids},
+                            metadata={"prior_questions":
+                                      [t["question"] for t in turns]})
 
             # 1. Retrieve. Sent immediately: it is fast, and showing the
             #    evidence before the argument is the whole trust model.
@@ -684,10 +753,21 @@ async def chat(q: Question, request: Request,
                     retriever.retrieve, q.question, q.k, prior_ids)
                 if retr_span:
                     retr_span.update(
-                        output=[r.chunk.node_id for r in results],
+                        # Ids alone made a wrong retrieval unreadable in the
+                        # UI — you had to look up every id by hand to see what
+                        # came back. Label and score make the span self-
+                        # explanatory, which is the whole reason to record it.
+                        output=[{"id": r.chunk.node_id, "label": r.chunk.label,
+                                 "hop": r.hop, "score": round(r.score, 3),
+                                 "via": r.via} for r in results],
                         metadata={"vocab_hits": trace.vocab_hits,
                                  "intents": trace.intents,
                                  "fused": trace.fused,
+                                 "dense_error": trace.dense_error,
+                                 "bm25_ranks": trace.bm25_ranks,
+                                 "dense_ranks": trace.dense_ranks,
+                                 "prior_seeds": prior_ids,
+                                 "k": q.k,
                                  "intent": plan.intent})
 
             # A direct lookup names its own provision, so an empty BM25 result
@@ -731,9 +811,27 @@ async def chat(q: Question, request: Request,
             #     answers were already structured data in the graph. Rendering
             #     them removes the model, and with it the failure mode.
             if plan.uses_template:
-                rendered = await asyncio.to_thread(
-                    templates.render, plan.intent, results, graph,
-                    plan.provision_id)
+                # Spanned even though no model runs. A template answer used to
+                # produce a Langfuse trace holding `retrieve` and nothing
+                # else, which reads as a request that died — when in fact it
+                # is the strongest path in the system. "Answered from the
+                # graph, zero model calls" is a claim worth being able to SEE.
+                with observability.step(
+                        "render_template", as_type="tool",
+                        input={"intent": plan.intent,
+                               "provision_id": plan.provision_id}) as tpl_span:
+                    rendered = await asyncio.to_thread(
+                        templates.render, plan.intent, results, graph,
+                        plan.provision_id)
+                    if tpl_span:
+                        tpl_span.update(
+                            output=rendered.text if rendered else None,
+                            level=None if rendered else "WARNING",
+                            status_message=None if rendered else
+                                "graph could not support this intent; "
+                                "falling through to synthesis",
+                            metadata={"citations": rendered.citations
+                                      if rendered else []})
                 if rendered is not None:
                     async for event in _stream_template(
                             rendered, graph, results, plan, commencement,
@@ -815,8 +913,17 @@ async def chat(q: Question, request: Request,
                 finally:
                     loop.call_soon_threadsafe(queue.put_nowait, ("eof", None))
 
-            with observability.step("generate", as_type="generation",
-                                    model=active_model, input=prompt) as gen_span:
+            with observability.step(
+                    "generate", as_type="generation", model=active_model,
+                    model_parameters={
+                        "structured_output": config.STRUCTURED_OUTPUT,
+                        "large": use_large,
+                        "num_ctx": config.NUM_CTX},
+                    # The system prompt is half of what produced this answer.
+                    # Recording only the user turn made a prompt regression
+                    # invisible in the trace that contained it.
+                    input=[{"role": "system", "content": system},
+                           {"role": "user", "content": prompt}]) as gen_span:
                 loop.run_in_executor(None, produce)
 
                 # Extracts the `answer` field out of the JSON prefix as it
@@ -874,7 +981,13 @@ async def chat(q: Question, request: Request,
                     structured_ok = False
 
                 if gen_span:
-                    gen_span.update(output=answer)
+                    gen_span.update(
+                        output=answer,
+                        metadata={"structured_ok": structured_ok,
+                                  "claimed_citations": claimed_citations,
+                                  "provider": config.LARGE_PROVIDER
+                                              if use_large else config.PROVIDER,
+                                  "answer_chars": len(answer)})
 
             # 4. Check what it cited, and render amounts from the graph.
             with observability.step("verify_citations", as_type="evaluator",
@@ -889,8 +1002,24 @@ async def chat(q: Question, request: Request,
                            else citations.check(answer, retrieved_ids, graph))
                 penalties = citations.penalty_facts(results, graph)
                 if verify_span:
+                    unverified = [c.id for c in checked if c.status != "verified"]
                     verify_span.update(
-                        output=[{"id": c.id, "status": c.status} for c in checked])
+                        output=[{"id": c.id, "label": c.label,
+                                 "status": c.status, "note": c.note}
+                                for c in checked],
+                        # WARNING, not ERROR: an out-of-context or invented
+                        # citation is caught and labelled, not fatal. But it
+                        # is the single thing most worth being able to filter
+                        # traces on, so it must be visible without opening
+                        # each one.
+                        level="WARNING" if unverified else None,
+                        status_message=f"{len(unverified)} citation(s) not "
+                                       f"verified: {unverified}"
+                                       if unverified else None,
+                        metadata={"method": "structured" if structured_ok
+                                            and claimed_citations else "regex",
+                                  "retrieved": sorted(retrieved_ids),
+                                  "unverified": unverified})
 
             citations_payload = {
                 "citations": [c.to_dict() for c in checked],
@@ -902,19 +1031,29 @@ async def chat(q: Question, request: Request,
             #    class of error — no NLI model required.
             claims_payload: list = []
             if config.NUMERIC_CHECK:
-                evidence = [r.chunk.verbatim for r in results]
-                amounts = [graph.provisions[r.chunk.node_id].penalty
-                           for r in results
-                           if r.chunk.node_id in graph.provisions
-                           and graph.provisions[r.chunk.node_id].penalty]
-                numeric_claims = await asyncio.to_thread(
-                    numeric.check, answer, evidence, amounts, q.question)
-                claims_payload.extend(c.to_dict() for c in numeric_claims)
-                if numeric.has_contradiction(numeric_claims):
-                    log.warning("unsupported figure in answer [%s]: %s",
-                                request_id,
-                                [c.surface for c in numeric_claims
-                                 if c.verdict == "unsupported"])
+                with observability.step("numeric_check", as_type="evaluator",
+                                        input=answer) as num_span:
+                    evidence = [r.chunk.verbatim for r in results]
+                    amounts = [graph.provisions[r.chunk.node_id].penalty
+                               for r in results
+                               if r.chunk.node_id in graph.provisions
+                               and graph.provisions[r.chunk.node_id].penalty]
+                    numeric_claims = await asyncio.to_thread(
+                        numeric.check, answer, evidence, amounts, q.question)
+                    claims_payload.extend(c.to_dict() for c in numeric_claims)
+                    bad = [c.surface for c in numeric_claims
+                           if c.verdict == "unsupported"]
+                    if numeric.has_contradiction(numeric_claims):
+                        log.warning("unsupported figure in answer [%s]: %s",
+                                    request_id, bad)
+                    if num_span:
+                        num_span.update(
+                            output=[c.to_dict() for c in numeric_claims],
+                            level="WARNING" if bad else None,
+                            status_message=f"figures not found in the cited "
+                                           f"text: {bad}" if bad else None,
+                            metadata={"amounts_from_graph": amounts,
+                                      "checked": len(numeric_claims)})
 
             stale = commencement.not_yet_in_force(
                 [c.id for c in checked], as_of)
@@ -945,8 +1084,11 @@ async def chat(q: Question, request: Request,
             if root:
                 root.update(output=answer, metadata={
                     "citation_statuses": [c.status for c in checked],
+                    "citations": [c.id for c in checked],
                     "path": "llm", "intent": plan.intent,
                     "model": active_model, "structured": structured_ok,
+                    "claims": [c.get("verdict") for c in claims_payload],
+                    "context_chars": len(prompt),
                     "elapsed_ms": elapsed_ms()})
             observability.flush()
 
