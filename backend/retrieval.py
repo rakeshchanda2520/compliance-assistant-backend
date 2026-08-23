@@ -77,6 +77,9 @@ class Trace:
     dense_scores: dict[str, float] = field(default_factory=dict)
     fused: bool = False
     dense_error: str = ""
+    # The top raw BM25 score, kept because `Result.score` stops being a BM25
+    # score the moment RRF fusion is on. See should_abstain.
+    top_bm25: float = 0.0
 
 
 class Retriever:
@@ -198,7 +201,16 @@ class Retriever:
             chosen = {s.id for s in seeds}
             for i, chunk in enumerate(self.chunks):
                 if chunk.kind == "Penalty" and chunk.id not in chosen:
-                    seeds.append(Result(chunk, round(float(scores[i]), 4), hop=0))
+                    # 0.0, like the prior-turn seeds above, and for the same
+                    # reason: these rows are here for completeness, not
+                    # because they ranked. Appending their BM25 score put two
+                    # incompatible scales in one list — under RRF fusion the
+                    # seeds score ~0.05 and a forced row ~20, so the rows
+                    # added for completeness sorted above every row that
+                    # actually matched, and crowded them out of the context
+                    # window.
+                    seeds.append(Result(chunk, 0.0, hop=0,
+                                        via="schedule completeness"))
 
         return self._expand(seeds), trace
 
@@ -210,6 +222,10 @@ class Retriever:
         order = sorted(range(len(bm25_scores)), key=lambda i: -bm25_scores[i])
         trace.bm25_ranks = {self.chunks[i].node_id: rank
                             for rank, i in enumerate(order[:20])}
+        # Captured HERE, before fusion, because this is the last point at
+        # which a BM25 score exists as such. Everything downstream may be an
+        # RRF score instead, and the two are not comparable.
+        trace.top_bm25 = float(bm25_scores[order[0]]) if len(order) else 0.0
 
         if not (config.HYBRID and self.dense_index):
             return [Result(self.chunks[i], round(float(bm25_scores[i]), 4), hop=0)
@@ -326,15 +342,36 @@ def build_context(results: list[Result], max_chars: int) -> str:
     return "\n".join(parts)
 
 
-def should_abstain(results: list[Result], threshold: float) -> str | None:
+def should_abstain(results: list[Result], threshold: float,
+                   trace: Trace) -> str | None:
     """Refuse before spending a generation call on a question the corpus
     plainly does not cover.
 
-    Deterministic and auditable, unlike asking the model to judge its own
-    competence — which is exactly the judgement a small model is worst at.
+    Judged on `trace.top_bm25`, NOT on `Result.score`. That distinction is
+    the whole bug this signature exists to prevent: `Result.score` is a BM25
+    score only when hybrid retrieval is off. With DPDP_HYBRID=1 — the
+    default — it is a Reciprocal Rank Fusion score, which lives in roughly
+    [0.016, 0.05] because RRF is rank-based. Comparing that against a
+    threshold calibrated on BM25's unbounded scale meant `top < threshold`
+    was true for EVERY question, so every request that reached this gate
+    abstained. It went unnoticed because the four template intents return
+    before this point, so penalty and definition questions kept working
+    while everything else silently refused.
+
+    An RRF score cannot be repaired into an abstention signal, either: the
+    top-ranked item always scores about 1/(RRF_K) regardless of whether
+    anything relevant was found. Rank says which result is best; it says
+    nothing about whether the best one is any good.
+
+    What this gate is: a floor for obvious noise. What it is NOT: an
+    out-of-domain classifier. Measured on this corpus, the two populations
+    overlap badly — "what does section 8 say?" scores 7.3, while "how do I
+    invest in mutual funds" scores 15.6 — so no threshold separates them.
+    See config.ABSTAIN_THRESHOLD for the numbers and for what carries the
+    real load instead (the jurisdiction gate, and a prompt that requires the
+    model to say when the supplied provisions do not settle the question).
     """
-    top = max((r.score for r in results if r.hop == 0), default=0.0)
-    if top < threshold:
-        return (f"closest match scored {top:.1f}, below the {threshold:.0f} "
-                f"threshold for an in-scope question")
+    if trace.top_bm25 < threshold:
+        return (f"closest match scored {trace.top_bm25:.1f}, below the "
+                f"{threshold:.0f} threshold for an in-scope question")
     return None

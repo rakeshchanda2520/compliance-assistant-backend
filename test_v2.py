@@ -20,7 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backend import citations, numeric, streaming, temporal, understanding  # noqa: E402
+from backend import (citations, numeric, retrieval, streaming, temporal,  # noqa: E402
+                     templates, understanding)
 from backend.graph_store import _marker_key                       # noqa: E402
 from backend.indexing import Chunk                                # noqa: E402
 from backend.ratelimit import RateLimiter                         # noqa: E402
@@ -256,6 +257,61 @@ if ui.is_file():
         check(f"frontend CITE still declares {token}", token in source)
 else:
     print("  skip  frontend/index.html not in this checkout")
+
+
+# --------------------------------------------------------------------------- #
+# Gating. Both bugs below shipped, and both were silent: the system kept
+# answering, just the wrong questions and not the right ones.
+print("\ngating - abstain gate and template subject guards")
+
+
+class _Chunk:
+    def __init__(self, node_id, kind="Section", label="Section 1"):
+        self.id = node_id
+        self.node_id = node_id
+        self.kind = kind
+        self.label = label
+        self.headnote = ""
+        self.verbatim = ""
+        self.chapter = ""
+
+
+def _res(node_id, score, kind="Section", label="Section 1", hop=0):
+    return retrieval.Result(_Chunk(node_id, kind, label), score, hop=hop)
+
+
+# BUG 1: the gate compared Result.score against a BM25-scale threshold, but
+# Result.score is a Reciprocal Rank Fusion score (~0.05) whenever hybrid
+# retrieval is on - the default. `top < threshold` was therefore true for
+# EVERY question that reached the gate, so everything on the model path
+# abstained. It hid behind the template intents, which return earlier.
+strong = retrieval.Trace("q", [], [], fused=True, top_bm25=21.2)
+weak = retrieval.Trace("q", [], [], fused=True, top_bm25=3.1)
+
+check("real question survives its own RRF score",
+      retrieval.should_abstain([_res("s-9-4", 0.0500)], 8.0, strong) is None)
+check("gate reads trace.top_bm25, not Result.score",
+      retrieval.should_abstain([_res("s-1", 0.0499)], 8.0, weak) is not None)
+check("abstain reason quotes the BM25 score",
+      "3.1" in (retrieval.should_abstain([_res("s-1", 0.0499)], 8.0, weak) or ""))
+
+# BUG 2: a template renders from the graph and returns BEFORE the gate, so
+# nothing downstream can catch it answering a question it was never about -
+# its citations are `verified` by construction. "what is the tallest
+# mountain" matched the definition regex and rendered the DPDP definition of
+# "automated".
+check("defined term lifted out of a Gazette label",
+      templates._term_of('Definition of “Data Fiduciary”') == "Data Fiduciary")
+check("plain-quoted label also works",
+      templates._term_of('Definition of "Consent Manager"') == "Consent Manager")
+check("question naming the term matches",
+      templates._question_is_about("Data Fiduciary", "what is a Data Fiduciary?"))
+check("word order does not matter",
+      templates._question_is_about("Data Principal", "who is a data principal"))
+check("unrelated question does not match a defined term",
+      not templates._question_is_about("automated", "what is the tallest mountain"))
+check("unrelated question does not match a defined term (2)",
+      not templates._question_is_about("Data Fiduciary", "what is the best pizza topping"))
 
 
 # --------------------------------------------------------------------------- #

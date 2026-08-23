@@ -29,6 +29,7 @@ to synthesis. A template that guessed would be worse than no template.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from .citations import label_for
@@ -70,13 +71,13 @@ class Rendered:
 
 
 def render(intent: str, results: list[Result], graph: Graph,
-           provision_id: str = "") -> Rendered | None:
+           provision_id: str = "", question: str = "") -> Rendered | None:
     """Dispatch. None means "the graph cannot answer this" — fall through."""
     try:
         if intent == "penalty":
             return _penalty(results, graph)
         if intent == "definition":
-            return _definition(results, graph)
+            return _definition(results, graph, question)
         if intent == "retention":
             return _retention(results, graph)
         if intent == "direct_lookup":
@@ -89,6 +90,47 @@ def render(intent: str, results: list[Result], graph: Graph,
 
 
 # --------------------------------------------------------------------------- #
+
+# A template renders from the GRAPH, not from the model, so nothing downstream
+# can catch it being about the wrong thing: its citations are `verified` by
+# construction, and it returns before the abstention gate ever runs. That is
+# only safe while the thing rendered is the thing the question asked about,
+# which is what the guards below establish. Without them the intent LABEL
+# alone decided the answer, and the label comes from a regex — so "what is the
+# tallest mountain" matched the `what is a ...` pattern, retrieval returned
+# its best-effort nearest chunks as it always does, and the reader was told
+# "The law defines this term itself" above the DPDP definition of "automated",
+# marked verified.
+
+def _term_of(label: str) -> str:
+    """The defined term out of a Definition's label.
+
+    Labels read: Definition of “Data Fiduciary” — curly quotes, from the
+    Gazette. Falls back to stripping the prefix when the quotes are absent.
+    """
+    if quoted := re.search(r"[\"“'‘]([^\"”'’]+)", label):
+        return quoted.group(1)
+    return re.sub(r"^\s*definitions?\s+of\s+", "", label, flags=re.I).strip()
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _question_is_about(term: str, question: str) -> bool:
+    """Does the question actually name this defined term?
+
+    Every word of the term must appear in the question — order-free, so
+    "who is a Data Principal?" matches "Data Principal", while "what is the
+    tallest mountain" matches nothing in the corpus and correctly declines.
+    A false negative here is cheap: the request falls through to synthesis,
+    which answers from the same retrieved provisions with a model that is
+    required to say when they do not settle the question. A false POSITIVE
+    is a confident wrong answer wearing a verified citation.
+    """
+    term_words = _words(term)
+    return bool(term_words) and term_words <= _words(question)
+
 
 def _penalty(results: list[Result], graph: Graph) -> Rendered | None:
     """Schedule rows, their amounts, and the duty each one penalises.
@@ -144,7 +186,8 @@ def _penalty(results: list[Result], graph: Graph) -> Rendered | None:
                     citations=_dedupe(cited), intent="penalty")
 
 
-def _definition(results: list[Result], graph: Graph) -> Rendered | None:
+def _definition(results: list[Result], graph: Graph,
+                question: str = "") -> Rendered | None:
     """The verbatim definition, plus where the term is actually used.
 
     The usage sites come from MENTIONS edges — exhaustive by construction at
@@ -155,7 +198,17 @@ def _definition(results: list[Result], graph: Graph) -> Rendered | None:
     if not hits:
         return None
 
-    top = hits[0]
+    # The FIRST definition the question actually names, not simply the
+    # best-ranked one. Retrieval always returns something, so ranking alone
+    # cannot distinguish "the definition they asked for" from "the nearest
+    # definition to a question about pizza".
+    top = next((h for h in hits
+                if _question_is_about(_term_of(h.chunk.label), question)), None)
+    if top is None:
+        log.info("definition template declined: question names no defined "
+                 "term (best candidate was %r)", hits[0].chunk.label)
+        return None
+
     provision = graph.provisions.get(top.chunk.node_id)
     if provision is None or not provision.text.strip():
         return None
@@ -203,6 +256,20 @@ def _retention(results: list[Result], graph: Graph) -> Rendered | None:
     """
     schedule = graph.provisions.get("rules-sch-third")
     if schedule is None:
+        return None
+
+    # Retrieval has to agree that this question is about the retention rules.
+    # This template reads rules-sch-third straight out of the graph and never
+    # looks at `results`, so on the intent label alone it answered "can we
+    # keep data on servers outside India?" — a section 16 cross-border
+    # question, which retrieval got RIGHT — with the Third Schedule's
+    # retention periods. Same for "how do I get a company to delete my data?",
+    # which is the section 12 right to erasure.
+    if not any(r.chunk.node_id == "rules-sch-third"
+               or r.chunk.node_id.startswith(("rules-sch-third-", "r-8"))
+               for r in results):
+        log.info("retention template declined: retrieval found %s, not the "
+                 "Third Schedule", results[0].chunk.label if results else "nothing")
         return None
 
     rows = [graph.provisions[n] for n in graph.children_of("rules-sch-third")

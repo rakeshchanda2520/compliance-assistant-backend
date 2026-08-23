@@ -165,12 +165,32 @@ RATE_WINDOW = _int("DPDP_RATE_WINDOW", 3600)
 # this, "is rule 4 in force?" is a reading-comprehension question put to a
 # language model instead of a date comparison.
 AS_OF_DEFAULT = _env("DPDP_AS_OF_DEFAULT", "today")
-# Below this BM25 score the corpus contains nothing resembling an answer.
-# Calibrated against out-of-scope probes: clearly unrelated questions score
-# 7-12, genuine ones 22-85. It catches the obvious end only — questions from
-# adjacent legal domains (GDPR, HIPAA) share enough vocabulary to score high,
-# so this is a first-line filter, not a domain classifier.
-ABSTAIN_THRESHOLD = float(_env("DPDP_ABSTAIN_THRESHOLD", "15.0"))
+# A floor on the top *BM25* score — see retrieval.should_abstain, which is
+# handed trace.top_bm25 explicitly rather than reading Result.score, because
+# Result.score is an RRF score whenever hybrid retrieval is on.
+#
+# 8.0, and the old 15.0 was measured to be wrong twice over. Re-measured on
+# this corpus with 24 genuine compliance questions and 15 clearly unrelated
+# ones:
+#
+#     genuine     7.3 - 24.6   ("what does section 8 say?" is the 7.3)
+#     unrelated   6.5 - 15.6   ("how do I invest in mutual funds" is the 15.6)
+#
+# The populations OVERLAP. No threshold separates them, so the old comment
+# here ("unrelated 7-12, genuine 22-85") did not describe this corpus, and at
+# 15.0 the gate refused 10 of the 24 genuine questions — including five of the
+# six example questions shipped on the frontend's own home screen.
+#
+# So this is set where it stops blatant noise and nothing else, and the
+# asymmetry is deliberate: refusing a real compliance question breaks the
+# product, while attempting an unrelated one costs a single model call and
+# produces "the provisions supplied do not settle this", which is a correct
+# and honest answer. The real out-of-scope work is done by the jurisdiction
+# gate in understanding.py (which catches the DANGEROUS case — GDPR and HIPAA
+# questions score as high as genuine ones precisely because they share real
+# legal vocabulary) and by prompt.py requiring the model to say when the
+# retrieved provisions do not answer the question.
+ABSTAIN_THRESHOLD = float(_env("DPDP_ABSTAIN_THRESHOLD", "8.0"))
 
 # --- Authentication (Supabase) ---------------------------------------------- #
 # Required: every answer must be attributable to a signed-in user, and an open

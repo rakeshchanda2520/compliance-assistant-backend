@@ -822,7 +822,7 @@ async def chat(q: Question, request: Request,
                                "provision_id": plan.provision_id}) as tpl_span:
                     rendered = await asyncio.to_thread(
                         templates.render, plan.intent, results, graph,
-                        plan.provision_id)
+                        plan.provision_id, q.question)
                     if tpl_span:
                         tpl_span.update(
                             output=rendered.text if rendered else None,
@@ -847,7 +847,8 @@ async def chat(q: Question, request: Request,
 
             # 2. Abstain before spending a generation call on an out-of-scope
             #    question — deterministic, not left to the model's judgement.
-            if reason := retrieval.should_abstain(results, config.ABSTAIN_THRESHOLD):
+            if reason := retrieval.should_abstain(
+                    results, config.ABSTAIN_THRESHOLD, trace):
                 finish("abstained", reason=reason, retrieval_payload=retrieval_payload)
                 if root:
                     root.update(output=f"abstained: {reason}", level="WARNING")
