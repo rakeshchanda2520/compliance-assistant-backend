@@ -482,9 +482,8 @@ async def _stream_template(rendered, graph, results, plan, commencement,
         claims_payload.append({
             "claim": "commencement",
             "verdict": "not_yet_in_force",
-            "note": f"as of {as_of.isoformat()}, "
-                    + ", ".join(citations.label_for(n) for n in stale)
-                    + " has not commenced"})
+            "note": commencement.pending_note(
+                stale, as_of, citations.label_for)})
     if plan.caveat:
         claims_payload.append({"claim": "scope", "verdict": "caveat",
                                "note": plan.caveat})
@@ -844,6 +843,18 @@ async def chat(q: Question, request: Request,
                 log.info("template %r declined; using synthesis", plan.intent)
                 router_payload["path"] = "llm"
                 router_payload["template_declined"] = True
+                # The FIRST "router" event (above) already told the client
+                # path="template" — that was the best guess before retrieval
+                # even ran. Without re-announcing the correction, every
+                # consumer of this stream (the frontend's routing badge, this
+                # eval harness's `ask()`, a Langfuse-metadata reader) is stuck
+                # believing a request answered by the model was answered from
+                # the graph with zero hallucination risk — the exact opposite
+                # of what a declined template means. Caught by
+                # eval/run_csv_report.py: a "template" row that carried a
+                # populated `model` field, which a real template answer never
+                # has (see _stream_template's done event, model=None always).
+                yield _sse("router", router_payload)
 
             # 2. Abstain before spending a generation call on an out-of-scope
             #    question — deterministic, not left to the model's judgement.
@@ -1061,9 +1072,8 @@ async def chat(q: Question, request: Request,
             if stale:
                 claims_payload.append({
                     "claim": "commencement", "verdict": "not_yet_in_force",
-                    "note": f"as of {as_of.isoformat()}, "
-                            + ", ".join(citations.label_for(n) for n in stale)
-                            + " has not commenced"})
+                    "note": commencement.pending_note(
+                        stale, as_of, citations.label_for)})
             if plan.caveat:
                 claims_payload.append({"claim": "scope", "verdict": "caveat",
                                        "note": plan.caveat})

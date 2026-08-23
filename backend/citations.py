@@ -83,8 +83,58 @@ def label_for(node_id: str) -> str:
     bits = node_id.split("-")
     if len(bits) < 2:
         return node_id
-    head = "rule " if bits[0] == "r" else "§"
+    # "Section 8(5)", not "§8(5)". The section sign is standard in legal
+    # publishing and near-meaningless outside it — this product is written for
+    # compliance staff, engineers and product managers, and a reader who does
+    # not recognise the glyph cannot even say the citation out loud, let alone
+    # look it up. The Act and the Rules both spell the word out in their own
+    # text, so this is also closer to the source than the symbol was.
+    #
+    # Display only. RE_CITATION above still PARSES "§8(5)" — a model may well
+    # emit it, and refusing to recognise a citation because of how it was
+    # typed is exactly the failure the structured-output path exists to avoid.
+    # Both title-cased so a source card reads consistently — "Rule 6(1)"
+    # beside "Section 8(5)", not "rule 6(1)". RE_CITATION is
+    # case-insensitive, so this changes presentation only.
+    head = "Rule " if bits[0] == "r" else "Section "
     return f"{head}{bits[1]}" + "".join(f"({b})" for b in bits[2:])
+
+
+def display_text(node_id: str, graph: Graph) -> str:
+    """The text to SHOW on a source card for one provision.
+
+    A Section in this corpus is a container: its substance lives in its
+    sub-sections and its own `text` is empty. Sections 9, 10 and 32 are all
+    like this, and all three are cited by the penalty template as the duty a
+    Schedule row penalises — so a reader clicking through to "Section 32"
+    was shown a card headed "Voluntary undertaking." with nothing under it,
+    which reads as a broken citation rather than a structural fact about the
+    Act.
+
+    Falling back to the children is safe and not a paraphrase: those are the
+    section, verbatim and in document order. The card is collapsible, so
+    length costs nothing.
+    """
+    provision = graph.provisions.get(node_id)
+    if provision is None:
+        return ""
+
+    text = (provision.text or "").strip()
+    if node_id.startswith("pen-"):
+        # A Schedule row is only meaningful with its amount attached.
+        return f"{text}  —  {provision.penalty}".strip(" —")
+    if text:
+        return text
+
+    parts = []
+    for child in graph.descendants_of(node_id):
+        node = graph.provisions.get(child)
+        if node is None:
+            continue
+        body = (node.text or "").strip()
+        if body:
+            parts.append(body)
+    return "\n".join(parts)
 
 
 def _in_context(node_id: str, retrieved: set[str]) -> bool:
@@ -118,10 +168,7 @@ def check(answer: str, retrieved_node_ids: set[str], graph: Graph) -> list[Citat
             seen[node_id] = Citation(node_id, label_for(node_id), "unresolved", note=note)
             continue
 
-        text = provision.text
-        if node_id.startswith("pen-"):
-            # A Schedule row is only meaningful with its amount attached.
-            text = f"{provision.text}  —  {provision.penalty}".strip(" —")
+        text = display_text(node_id, graph)
 
         verified = _in_context(node_id, retrieved_node_ids)
         seen[node_id] = Citation(
@@ -168,9 +215,7 @@ def check_structured(claimed: list[dict], retrieved_node_ids: set[str],
                                      "unresolved", note=note)
             continue
 
-        text = provision.text
-        if node_id.startswith("pen-"):
-            text = f"{provision.text}  —  {provision.penalty}".strip(" —")
+        text = display_text(node_id, graph)
 
         verified = _in_context(node_id, retrieved_node_ids)
         seen[node_id] = Citation(
@@ -199,11 +244,9 @@ def check_template(node_ids: list[str], graph: Graph) -> list[Citation]:
         provision = graph.provisions.get(node_id)
         if provision is None:
             continue
-        text = provision.text
-        if node_id.startswith("pen-"):
-            text = f"{provision.text}  —  {provision.penalty}".strip(" —")
         out.append(Citation(id=node_id, label=label_for(node_id),
-                            status="verified", text=text.strip(),
+                            status="verified",
+                            text=display_text(node_id, graph),
                             headnote=provision.headnote))
     return out
 

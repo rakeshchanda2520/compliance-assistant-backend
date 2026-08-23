@@ -77,6 +77,43 @@ class Commencement:
                 f"{'; ' + self.reason_for(node_id) if self.reason_for(node_id) else ''}"),
         }
 
+    def pending_note(self, node_ids, when: date, label_for) -> str:
+        """A plain-English explanation of why a cited provision is flagged.
+
+        The old note said only "<X> has not commenced", which states the
+        conclusion and withholds everything a reader needs to act on it: what
+        "commenced" means, when it changes, and whether the answer above is
+        therefore wrong. It is not wrong — the provision IS the law on the
+        point, it simply is not enforceable yet — and saying so is the whole
+        value of the flag.
+
+        `label_for` is passed in rather than imported: citations.py already
+        imports graph_store, and importing it back here would be a cycle.
+        """
+        parts = []
+        for node_id in node_ids:
+            start = self._date_for(node_id)
+            when_txt = (f"takes effect on {start.strftime('%d %B %Y')}"
+                        if start else "has no commencement date on record")
+            parts.append(f"{label_for(node_id)} {when_txt}")
+
+        # The reason is only appended for a SINGLE provision. Different
+        # provisions commence on different schedules (rule 4 at one year,
+        # rule 15 at eighteen months), so attaching the first one's reason to
+        # a list of several states it of all of them, which is wrong.
+        reason = self.reason_for(node_ids[0]) if len(node_ids) == 1 else ""
+        detail = f" ({reason})" if reason else ""
+        # Subject and object pronouns are separate words. Reusing one for
+        # both produced "them are the law on this point".
+        one = len(node_ids) == 1
+        subj, obj, verb = ("it", "it", "is") if one else ("they", "them", "are")
+        return (
+            f"Quoted because {subj} {verb} the law on this point, but not "
+            f"enforceable yet: {'; '.join(parts)}{detail}. "
+            f"As of {when.strftime('%d %B %Y')} you cannot be penalised under "
+            f"{obj} — though {subj} {verb} what you will be held to once in "
+            "force.")
+
     def not_yet_in_force(self, node_ids, when: date) -> list[str]:
         return [n for n in node_ids if not self.in_force_on(n, when)]
 
