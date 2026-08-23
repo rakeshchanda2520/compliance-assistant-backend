@@ -629,7 +629,7 @@ async def chat(q: Question, request: Request,
             if config.INTENT_ROUTER or config.HYBRID:
                 try:
                     query_vector = await asyncio.to_thread(
-                        embeddings.embed_one, q.question, True)
+                        embeddings.embed_one, q.question, is_query=True)
                 except Exception as exc:               # noqa: BLE001
                     log.warning("query embedding unavailable: %s", exc)
 
