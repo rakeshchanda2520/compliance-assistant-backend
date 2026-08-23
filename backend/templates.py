@@ -121,20 +121,25 @@ def _penalty(results: list[Result], graph: Graph) -> Rendered | None:
 
         lines.append(
             f"**{provision.label}**{where}\n"
-            f"{breach}.\n"
-            f"Penalty: {amount}")
+            f"What it covers: {breach}.\n"
+            f"Maximum penalty: {amount}")
 
     if not lines:
         return None
 
     body = "\n\n".join(lines)
-    preamble = ("The Schedule to the Act sets these penalties. Amounts are read "
-                "directly from the Act's Schedule:"
-                if len(lines) > 1 else
-                "The Act's Schedule sets this penalty:")
-    footer = ("\n\nPenalties are imposed by the Data Protection Board after an "
-              "inquiry under section 27; the amounts above are the maximum the "
-              "Schedule permits.")
+    preamble = (
+        "Short answer:\nThe Act's Schedule sets the following maximum "
+        "penalties. The amounts below are read directly from the Schedule, "
+        "not restated from memory.\n\nThe law says:"
+        if len(lines) > 1 else
+        "Short answer:\nThe Act's Schedule sets the following maximum "
+        "penalty. The amount below is read directly from the Schedule, not "
+        "restated from memory.\n\nThe law says:")
+    footer = ("\n\nWhy:\nThese are ceilings, not fixed fines. A penalty is "
+              "imposed by the Data Protection Board of India only after an "
+              "inquiry under section 27, and the Board decides the actual "
+              "amount within the maximum shown above.")
     return Rendered(f"{preamble}\n\n{body}{footer}",
                     citations=_dedupe(cited), intent="penalty")
 
@@ -166,17 +171,23 @@ def _definition(results: list[Result], graph: Graph) -> Rendered | None:
     shown = used_in[:3]
     cited.extend(shown)
 
-    text = f"**{provision.label}** is defined as follows:\n\n{provision.text.strip()}"
+    text = ("Short answer:\nThe law defines this term itself. Here is the "
+            "definition in full, in the Act's own words.\n\n"
+            f"The law says:\n**{provision.label}** — "
+            f"{provision.text.strip()}")
 
     if shown:
         where = ", ".join(label_for(n) for n in shown)
-        more = f", and {len(used_in) - len(shown)} other provisions" \
+        more = f", and in {len(used_in) - len(shown)} other provisions" \
             if len(used_in) > len(shown) else ""
-        text += f"\n\nThis term is used in {where}{more}."
+        text += (f"\n\nWhy it matters:\nThis term carries the meaning above "
+                 f"everywhere it appears in the law. It is used in "
+                 f"{where}{more}, so the definition decides how each of those "
+                 f"applies to you.")
 
     others = [r for r in hits[1:3]]
     if others:
-        text += ("\n\nRelated definitions: "
+        text += ("\n\nRelated definitions you may also need: "
                  + ", ".join(r.chunk.label for r in others) + ".")
         cited.extend(r.chunk.node_id for r in others)
 
@@ -202,8 +213,10 @@ def _retention(results: list[Result], graph: Graph) -> Rendered | None:
                 if n in graph.provisions and "row" in n]
 
     cited = ["rules-sch-third"]
-    text = ("Retention is governed by rule 8 of the DPDP Rules, 2025, read "
-            "with the Third Schedule.\n\n")
+    text = ("Short answer:\nHow long you may keep personal data is set by "
+            "rule 8 of the DPDP Rules, 2025, read together with the Third "
+            "Schedule. The Schedule gives the period; rule 8 says what "
+            "happens when it runs out.\n\nThe law says:\n")
 
     if rule8 := graph.provisions.get("r-8-1"):
         text += f"{rule8.text.strip()}\n\n"
@@ -220,9 +233,11 @@ def _retention(results: list[Result], graph: Graph) -> Rendered | None:
     else:
         text += schedule.text.strip()
 
-    text += ("\n\nAfter the applicable period, the specified purpose is deemed "
-             "no longer served and the personal data must be erased unless "
-             "retention is required by law.")
+    text += ("\n\nWhat to do:\nOnce the period above has passed, the purpose "
+             "you collected the data for is treated as served, and you must "
+             "delete the personal data — along with any copies your "
+             "processors hold. The one exception is data you are required to "
+             "keep by some other law; keep a record of which law that is.")
     return Rendered(text, citations=_dedupe(cited), intent="retention")
 
 
@@ -239,7 +254,8 @@ def _direct_lookup(provision_id: str, graph: Graph) -> Rendered | None:
 
     cited = [provision.id]
     header = provision.headnote.strip() or provision.label
-    text = f"**{provision.label} — {header}**\n\n"
+    text = (f"The law says:\n**{provision.label} — {header}**, in full, in "
+            f"the instrument's own words:\n\n")
 
     if provision.text.strip():
         text += provision.text.strip() + "\n"
@@ -256,8 +272,8 @@ def _direct_lookup(provision_id: str, graph: Graph) -> Rendered | None:
     if penalty_entry := graph.penalty_for().get(provision_id):
         entry = graph.provisions.get(penalty_entry)
         if entry:
-            text += (f"\n\nBreach of this provision is penalised by "
-                     f"{entry.label}: {entry.penalty}")
+            text += (f"\n\nPenalty:\nBreaching this provision is penalised "
+                     f"under {entry.label}, up to {entry.penalty}.")
             cited.append(penalty_entry)
 
     return Rendered(text.rstrip(), citations=_dedupe(cited),

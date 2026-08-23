@@ -217,7 +217,14 @@ MONGODB_DB = _env("MONGODB_DB", "compliance_assistant")
 # NEO4J_*, an install with nothing set here just doesn't trace.
 LANGFUSE_PUBLIC_KEY = _env("LANGFUSE_PUBLIC_KEY")
 LANGFUSE_SECRET_KEY = _env("LANGFUSE_SECRET_KEY")
-LANGFUSE_HOST = _env("LANGFUSE_HOST", "https://cloud.langfuse.com")
+# Both spellings accepted. The V1 prototype called this LANGFUSE_BASE_URL and
+# the rewrite renamed it to LANGFUSE_HOST (the Langfuse SDK's own name for the
+# argument) — but a .env carried over from V1 still says BASE_URL, and reading
+# only HOST silently sends every trace to Langfuse Cloud instead of the
+# self-hosted instance the file names. Nothing errors; the traces just are not
+# where anyone is looking for them.
+LANGFUSE_HOST = (_env("LANGFUSE_HOST") or _env("LANGFUSE_BASE_URL")
+                 or "https://cloud.langfuse.com").rstrip("/")
 TRACING_ENABLED = bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY)
 
 # --- HTTP ------------------------------------------------------------------ #

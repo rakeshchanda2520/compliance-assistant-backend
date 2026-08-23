@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backend import numeric, streaming, temporal, understanding   # noqa: E402
+from backend import citations, numeric, streaming, temporal, understanding  # noqa: E402
 from backend.graph_store import _marker_key                       # noqa: E402
 from backend.indexing import Chunk                                # noqa: E402
 from backend.ratelimit import RateLimiter                         # noqa: E402
@@ -215,6 +215,47 @@ short = Chunk(id="c2", node_id="s-1", kind="Section", label="Section 1",
               verbatim="Short text.", headnote="Title")
 check("short chunk keeps its verbatim text",
       "Short text." in short.embedding_text(1800))
+
+
+# --------------------------------------------------------------------------- #
+# The frontend carries its own copy of RE_CITATION (frontend/index.html's
+# CITE + citeNodeId) because it has to turn the same citations into clickable
+# links. Drift between the two is the definition of a silent failure: the
+# backend still marks a citation VERIFIED, the source card still renders, and
+# the only symptom is that nothing in the prose points at it. That is exactly
+# how "rule 6(1)" and every template answer ended up unlinkable.
+#
+# No JS engine is assumed. This asserts the Python side against the same
+# table the JS is checked against, and asserts the JS source still declares
+# every shape — enough to fail loudly when someone edits one and not the
+# other.
+print("\ncitations — shapes the frontend must mirror")
+
+SHAPES = {
+    "section 8(5)": "s-8-5",           # spelled out — templates write this
+    "§8(5)": "s-8-5",
+    "§ 8 (5)": "s-8-5",
+    "Section 8": "s-8",
+    "rule 6(1)": "r-6-1",              # the Rules; missing from the old UI regex
+    "rules 6": "r-6",
+    "Schedule entry 2": "pen-2",
+    "Schedule 2": "pen-2",
+    "First Schedule": "rules-sch-first",
+    "Part B of First Schedule": "rules-sch-first-part-b",
+    "Third Schedule": "rules-sch-third",
+}
+for surface, want in SHAPES.items():
+    match = citations.RE_CITATION.search(surface)
+    got = citations.node_id_from_match(match) if match else None
+    check(f"{surface!r} -> {want}", got == want, str(got))
+
+ui = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+if ui.is_file():
+    source = ui.read_text(encoding="utf-8")
+    for token in ("(?<sec>", "(?<rule>", "(?<entry>", "(?<ord>", "citeNodeId"):
+        check(f"frontend CITE still declares {token}", token in source)
+else:
+    print("  skip  frontend/index.html not in this checkout")
 
 
 # --------------------------------------------------------------------------- #

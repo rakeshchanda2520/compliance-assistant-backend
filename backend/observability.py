@@ -8,13 +8,39 @@ Nothing else in this codebase imports `langfuse` directly; every call goes
 through `trace()` / `step()` here, so the rest of the system never has to
 know whether tracing is on.
 
-One request becomes one root trace with three nested observations —
-`retrieve` (as_type="retriever"), `generate` (as_type="generation"),
-`verify_citations` (as_type="evaluator") — deliberately mirroring the three
-SSE stages `app.py` already streams and the three fields `audit.py` already
-writes to `logs/audit.jsonl`. A trace in the Langfuse UI, the browser's
-network tab, and a line in the local audit log all describe the same request
-the same way.
+One request becomes one root trace, with a nested observation for EVERY stage
+that does work — not just the three that produce SSE events. The earlier
+version instrumented only `retrieve`, `generate` and `verify_citations`, and
+that had two consequences worth spelling out, because both looked like bugs
+from the Langfuse UI:
+
+  * the query embedding and the intent routing ran inside the trace's own
+    window but had no span of their own, so they were invisible: a trace
+    showed a 1.2s gap before `retrieve` with nothing accounting for it.
+  * `generate` and `verify_citations` only exist on the model path. A penalty
+    question is answered from the graph with no model call at all — correct,
+    and the whole point of the template path — but in Langfuse it rendered as
+    a trace containing `retrieve` and nothing else, indistinguishable from a
+    request that had failed silently.
+
+Every stage now opens a span, including the ones that do not call a model, so
+the shape of a trace always describes what actually happened.
+
+Two identity axes, both first-class:
+
+    user_id      the Supabase user id (auth.users.id) — "everything this
+                 person has ever asked"
+    session_id   the CONVERSATION thread id — "the turns of this one
+                 conversation, in order". This is what Langfuse's Sessions
+                 view is built for, and it is why the thread id is minted in
+                 the browser and sent on every request rather than being
+                 implicit.
+
+The browser sign-in session (Supabase's own `auth.sessions.id`) is a third,
+coarser grouping — one sign-in can span several conversations — and rides in
+trace metadata plus a `sign-in:<id>` tag, since Langfuse has only one
+first-class session field and the conversation is the more useful thing to
+put in it.
 
 Verified resilient to a misconfigured or unreachable Langfuse endpoint: a
 failed span export is logged as a warning by the SDK and the request still
@@ -106,26 +132,36 @@ def _observation(name: str, as_type: str, **fields):
 
 
 @contextmanager
-def trace(name: str, *, user_id: str = "", session_id: str = "", **fields):
+def trace(name: str, *, user_id: str = "", session_id: str = "",
+          tags: list[str] | None = None, trace_metadata: dict | None = None,
+          **fields):
     """Root span for one request. A no-op (yields None) when tracing is off,
     so callers unconditionally write `with observability.trace(...) as t:`
     and guard direct use of `t` behind `if t:` — never behind a separate
     `if config.TRACING_ENABLED:` scattered through the caller.
 
-    `user_id`/`session_id` are Langfuse's own first-class trace attributes —
-    setting them is what turns the Langfuse UI's Users/Sessions views on,
-    and is what lets "every trace for this user" or "every trace in this
-    sign-in session" be filtered without grepping metadata. Applied via
+    `user_id`/`session_id`/`tags` are Langfuse's own first-class trace
+    attributes — setting them is what turns the Users and Sessions views on,
+    and is what lets "every trace for this person" or "every turn of this
+    conversation" be filtered without grepping metadata. Applied via
     `propagate_attributes()` so every child `step()` opened inside this
     `with` block inherits them automatically, rather than every call site
-    threading the same two values through by hand.
+    threading the same values through by hand.
+
+    `trace_metadata` is separate from `**fields`' own `metadata` on purpose:
+    `fields` describes the ROOT SPAN, `trace_metadata` propagates to the
+    whole trace and every child in it. Identity belongs in the second.
     """
     with _observation(name, "span", **fields) as root:
-        if not config.TRACING_ENABLED or root is None or not (user_id or session_id):
+        propagating = user_id or session_id or tags or trace_metadata
+        if not config.TRACING_ENABLED or root is None or not propagating:
             yield root
             return
         from langfuse import propagate_attributes
-        with propagate_attributes(user_id=user_id or None, session_id=session_id or None):
+        with propagate_attributes(user_id=user_id or None,
+                                  session_id=session_id or None,
+                                  tags=tags or None,
+                                  metadata=trace_metadata or None):
             yield root
 
 
