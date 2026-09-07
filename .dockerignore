@@ -1,14 +1,49 @@
+# The Dockerfile uses `COPY . .`, so this file is the ONLY thing standing
+# between a real credential and a published image layer. Deleting a line here
+# is a security change, not a cleanup.
+
+# ---- secrets -------------------------------------------------------------
+# .env holds live Neo4j, Supabase, OpenRouter and Mongo credentials. Baked
+# into a layer it is readable by anyone who can pull the image, and it stays
+# readable even if a later layer deletes it — layers are additive.
+# Configuration is injected at RUN time (--env-file / -e), never at build.
 .env
-# data/chunks.json and data/vocab.yaml ARE sent to the build context and
-# COPYed into the image now — this repo has no other way to get the corpus
-# onto a hosting platform. logs/ stays excluded: it's a local-dev-only
-# junction (see .gitignore), write-only runtime state, never a build input.
-logs/
-# Unlike .gitignore, dockerignore patterns are NOT recursive by default —
-# `__pycache__/` alone only matched the context root, not backend/backend/
-# __pycache__/, and a stray one leaked into a real build (caught by actually
-# running the image and looking, not by reading this file and assuming).
-**/__pycache__/
-**/*.pyc
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- git -----------------------------------------------------------------
+# .git carries the full history. If a secret was ever committed and later
+# removed, it is still in there.
+.git
+.gitignore
+
+# ---- things that must not become part of the image ----------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
-.git/
+venv/
+
+# Runtime state, written by the container. Copying a developer's logs in
+# would be both noise and a possible data leak.
+logs/
+
+# ---- not needed at runtime ----------------------------------------------
+# Kept OUT of the image but deliberately kept IN the repo. Excluding them
+# shrinks the image and cuts rebuild churn — editing a doc should not
+# invalidate the layer cache and force a reinstall.
+tests/
+eval/
+scripts/
+*.md
+Dockerfile
+.dockerignore
+
+# The Supabase schema is applied by hand, once, against the project. It is
+# not read by the running service.
+supabase_setup.sql
