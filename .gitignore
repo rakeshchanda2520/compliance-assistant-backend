@@ -1,0 +1,8 @@
+# Credentials. .env now holds real Neo4j/Supabase/OpenRouter/Mongo values.
+.env
+frontend/.env
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+logs/

@@ -1,0 +1,270 @@
+# Vocabulary bridge: how ordinary people say it -> what the Act calls it.
+#
+# The users of this system are not lawyers. They ask "can I text my customers
+# an offer?", not "is further processing for a distinct purpose lawful under
+# section 6(1)?". Every phrase on the left is expanded into the statutory terms
+# on the right before retrieval runs.
+#
+# Deterministic, auditable, and free — no model involved. This is the single
+# highest value-per-line file in the project. Add to it whenever a real user
+# question misses.
+
+terms:
+  # --- who is who -----------------------------------------------------------
+  customer: [Data Principal, personal data]
+  customers: [Data Principal, personal data]
+  user: [Data Principal]
+  users: [Data Principal]
+  client: [Data Principal]
+  clients: [Data Principal]
+  subscriber: [Data Principal]
+  citizen: [Data Principal]
+  individual: [Data Principal]
+  applicant: [Data Principal]
+  borrower: [Data Principal]
+  policyholder: [Data Principal]
+  account holder: [Data Principal]
+
+  we: [Data Fiduciary]
+  us: [Data Fiduciary]
+  our company: [Data Fiduciary]
+  our bank: [Data Fiduciary]
+  my business: [Data Fiduciary]
+  my company: [Data Fiduciary]
+  the business: [Data Fiduciary]
+  the bank: [Data Fiduciary]
+  the insurer: [Data Fiduciary]
+  the lender: [Data Fiduciary]
+  the platform: [Data Fiduciary]
+  the app: [Data Fiduciary]
+
+  vendor: [Data Processor]
+  vendors: [Data Processor]
+  third party: [Data Processor]
+  third parties: [Data Processor]
+  outsourced: [Data Processor]
+  service provider: [Data Processor]
+  subcontractor: [Data Processor]
+  saas: [Data Processor]
+  cloud provider: [Data Processor]
+
+  regulator: [Board, Data Protection Board of India, Central Government]
+  authority: [Board, Central Government]
+  government: [Central Government, State]
+  tribunal: [Appellate Tribunal]
+  dpo: [Data Protection Officer]
+  large company: [Significant Data Fiduciary]
+  big tech: [Significant Data Fiduciary]
+
+  # --- what the data is -----------------------------------------------------
+  data: [personal data]
+  info: [personal data]
+  information: [personal data]
+  details: [personal data]
+  records: [personal data]
+  pii: [personal data]
+  phone number: [personal data]
+  mobile number: [personal data]
+  email address: [personal data]
+  address: [personal data]
+  aadhaar: [personal data]
+  pan: [personal data]
+  kyc: [personal data, verification]
+  salary: [personal data]
+  photo: [personal data]
+  biometrics: [personal data]
+  location: [personal data]
+  browsing history: [personal data]
+  credit score: [personal data, financial information]
+  transaction history: [personal data]
+
+  # --- what happens to it ---------------------------------------------------
+  collect: [processing, collection]
+  collecting: [processing, collection]
+  store: [processing, storage]
+  storing: [processing, storage]
+  keep: [processing, storage, retention]
+  retain: [processing, storage, erasure]
+  use: [processing]
+  using: [processing]
+  share: [processing, disclosure, sharing]
+  sharing: [processing, disclosure, sharing]
+  sell: [processing, disclosure, sharing]
+  send abroad: [processing of personal data outside India]
+  transfer overseas: [processing of personal data outside India]
+  offshore: [processing of personal data outside India]
+  cross border: [processing of personal data outside India]
+  outside india: [processing of personal data outside India]
+  abroad: [processing of personal data outside India]
+  overseas: [processing of personal data outside India]
+  another country: [processing of personal data outside India]
+  foreign: [processing of personal data outside India]
+  data residency: [processing of personal data outside India]
+  localisation: [processing of personal data outside India]
+  analytics: [processing]
+  profiling: [processing]
+  marketing: [processing, specified purpose, consent]
+  advertising: [processing, specified purpose, consent]
+  promotions: [processing, specified purpose, consent]
+  offers: [processing, specified purpose, consent]
+
+  # --- when it goes wrong ---------------------------------------------------
+  leak: [personal data breach]
+  leaked: [personal data breach]
+  hack: [personal data breach]
+  hacker: [personal data breach]
+  attacker: [personal data breach]
+  breach: [personal data breach]
+  # Irregular verbs need their own entries — the matcher only handles regular
+  # -s/-es/-ed/-ing endings.
+  steal: [personal data breach]
+  stole: [personal data breach]
+  stolen: [personal data breach]
+  ransomware: [personal data breach]
+  data loss: [personal data breach]
+  exposed: [personal data breach]
+  incident: [personal data breach]
+  security: [reasonable security safeguards]
+  encryption: [reasonable security safeguards]
+  safeguards: [reasonable security safeguards]
+
+  # --- rights ---------------------------------------------------------------
+  delete my data: [erasure, right to erasure]
+  right to be forgotten: [erasure, right to erasure]
+  remove my data: [erasure]
+  correct my data: [correction, right to correction]
+  update my details: [correction]
+  wrong: [correction, right to correction, inaccurate]
+  incorrect: [correction, right to correction, inaccurate]
+  inaccurate: [correction, right to correction]
+  mistake: [correction, right to correction]
+  outdated: [correction, right to correction, complete]
+  out of date: [correction, right to correction]
+  fix: [correction, right to correction]
+  change my: [correction, right to correction]
+  spelling: [correction, right to correction]
+  see my data: [right to access information about personal data]
+  what data do you have: [right to access information about personal data]
+  opt out: [withdraw her consent, withdrawal]
+  unsubscribe: [withdraw her consent, withdrawal]
+  withdraw: [withdraw her consent, withdrawal]
+  complain: [grievance redressal, complaint, Board]
+  complaint: [grievance redressal, complaint, Board]
+  nominee: [right to nominate, nominate]
+  after death: [right to nominate, nominate]
+  died: [right to nominate, nominate, death]
+  death: [right to nominate, nominate]
+  deceased: [right to nominate, nominate]
+  passed away: [right to nominate, nominate]
+  next of kin: [right to nominate, nominate]
+  legal heir: [right to nominate, nominate]
+  incapacity: [right to nominate, incapacity]
+  coma: [right to nominate, incapacity]
+
+  # --- special cases --------------------------------------------------------
+  # Keep entries in their singular root — the matcher adds -s/-es/-ed/-ing, so
+  # "kid" reaches "kids" but "kids" never reaches "kid".
+  kid: [child, children]
+  child: [child, children]
+  children: [child]
+  minor: [child]
+  teenager: [child]
+  under 18: [child]
+  underage: [child]
+  student: [child]
+  signed up: [consent, Data Principal]
+  parent: [parents or lawful guardian]
+  guardian: [lawful guardian]
+  disabled: [person with disability, lawful guardian]
+  tracking kids: [tracking, behavioural monitoring, child]
+  ads to kids: [targeted advertising, child]
+
+  # --- consequences ---------------------------------------------------------
+  fine: [penalty, Schedule]
+  fines: [penalty, Schedule]
+  penalty: [penalty, Schedule]
+  punishment: [penalty, Schedule]
+  how much: [penalty, Schedule]
+  liable: [penalty, Data Fiduciary]
+  # The Data Principal has duties too, and breaching them carries its own
+  # (much smaller) penalty — easy to miss among six Data Fiduciary entries.
+  duty: [duties, Duties of Data Principal]
+  responsibilities: [duties, Duties of Data Principal]
+  responsibility: [duties, Duties of Data Principal]
+  my fault: [duties, Duties of Data Principal]
+  customer at fault: [duties, Duties of Data Principal]
+  false complaint: [duties, Duties of Data Principal]
+  fake details: [duties, Duties of Data Principal]
+  jail: [penalty]
+  prosecution: [penalty, proceeding]
+
+  # --- process --------------------------------------------------------------
+  permission: [consent, notice]
+  approval: [consent]
+  agree: [consent]
+  tick box: [consent, notice]
+  privacy policy: [notice, specified purpose]
+  terms and conditions: [notice, consent]
+  do we need consent: [consent, certain legitimate uses]
+  exempt: [exemption, shall not apply]
+  exemption: [exemption, shall not apply]
+  do we have to: [obligation, shall]
+  startup: [startup, exemption]
+
+  # --- the Rules, 2025 ------------------------------------------------------
+  # The Rules answer the "what exactly must we do" half of most questions, but
+  # they say it in their own words. Without these bridges a question phrased
+  # the way a user phrases it retrieves the Act's duty and misses the Rules'
+  # specifics entirely — measured: "what must we tell a user when we notify
+  # them of a breach" reached §8(6) but not rule 7, which is the provision
+  # that actually lists what to tell them.
+  notify: [intimation, intimate, personal data breach]
+  notification: [intimation, intimate]
+  tell them: [intimation, intimate]
+  inform: [intimation, intimate]
+  report a breach: [intimation, personal data breach, Board]
+  how long: [time period, erase, retention, Third Schedule]
+  how long can we keep: [time period, erase, retention, Third Schedule]
+  retention: [time period, erase, retention, Third Schedule]
+  retention period: [time period, erase, Third Schedule]
+  delete after: [erase, time period]
+  erase: [erase, time period]
+  encryption: [encryption, security safeguards, obfuscation, masking]
+  encrypt: [encryption, security safeguards]
+  logs: [logs, monitoring, review, one year]
+  audit log: [logs, monitoring, review]
+  backup: [data-backups, continued processing]
+  consent manager: [Consent Manager, First Schedule, registration]
+  register as consent manager: [Consent Manager, First Schedule]
+  net worth: [net worth, two crore rupees, First Schedule]
+  parental consent: [verifiable consent, parent, child, guardian]
+  verify age: [verifiable consent, adult, age, virtual token]
+  age verification: [verifiable consent, adult, identity and age]
+  children data: [child, verifiable consent, Fourth Schedule]
+  school: [educational institution, Fourth Schedule, child]
+  healthcare: [clinical establishment, healthcare professional, Fourth Schedule]
+  significant data fiduciary: [Significant Data Fiduciary, algorithmic, audit]
+  dpia: [Data Protection Impact Assessment, audit]
+  data protection officer: [Data Protection Officer, contact information]
+  appeal: [Appellate Tribunal, appeal, digital office]
+  contact us: [business contact information, Data Protection Officer]
+  when does this start: [come into force, commencement, publication]
+  deadline: [come into force, commencement, time period]
+
+# Intent hints — steer retrieval toward the chapter that governs the question.
+intents:
+  penalty_lookup:
+    triggers: [fine, penalty, how much, punishment, liable, crore]
+    boost_kinds: [Penalty, Schedule]
+  rights_lookup:
+    triggers: [my data, my rights, i want, can i ask, delete my, correct my]
+    boost_chapter: ch-III
+  obligation_lookup:
+    triggers: [do we, do i have to, are we required, must we, our obligation]
+    boost_chapter: ch-II
+  definition_lookup:
+    triggers: [what is, what does, who is, definition, meaning of, counts as]
+    boost_kinds: [Definition]
+  exemption_lookup:
+    triggers: [exempt, does this apply, do the rules apply, out of scope]
+    boost_chapter: ch-V
